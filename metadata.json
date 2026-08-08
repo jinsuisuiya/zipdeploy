@@ -1,0 +1,6 @@
+{
+  "name": "ZipDeploy Studio",
+  "description": "Minimalist browser-based ZIP extractor and GitHub REST API auto deployer.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
