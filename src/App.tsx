@@ -738,7 +738,7 @@ echo "https://\${USERNAME}.github.io/\${REPO}/"`;
             <div>
               <div className="flex items-center gap-2">
                 <h1 className="text-sm font-bold text-neutral-900 tracking-tight">
-                  ZipDeploy Studio
+                  zipdeploy
                 </h1>
                 <span className="text-[10px] font-mono font-medium text-neutral-500 bg-neutral-100 px-2 py-0.5 rounded-full border border-neutral-200">
                   Monochrome Edition
