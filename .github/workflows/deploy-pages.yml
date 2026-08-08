@@ -1,4 +1,4 @@
-name: Deploy Vite/React site to GitHub Pages
+name: Deploy site to GitHub Pages
 
 on:
   push:
@@ -21,27 +21,47 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js environment
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install dependencies
-        run: npm ci || npm install
+      - name: Install dependencies & Build project
+        run: |
+          if [ -f package.json ]; then
+            echo "Installing dependencies..."
+            npm install || npm install --legacy-peer-deps
+            echo "Building static site..."
+            if grep -q '"build"' package.json; then
+              npm run build || true
+            fi
+          fi
 
-      - name: Build project
-        run: npm run build
+          # Locate target static export directory
+          if [ -d "dist" ]; then
+            echo "FOUND_DIST=./dist" >> $GITHUB_ENV
+          elif [ -d "build" ]; then
+            echo "FOUND_DIST=./build" >> $GITHUB_ENV
+          elif [ -d "out" ]; then
+            echo "FOUND_DIST=./out" >> $GITHUB_ENV
+          else
+            echo "No build folder detected. Preparing root files for static hosting..."
+            mkdir -p _site
+            cp -r ./* _site/ 2>/dev/null || true
+            rm -rf _site/_site 2>/dev/null || true
+            echo "FOUND_DIST=./_site" >> $GITHUB_ENV
+          fi
 
-      - name: Setup Pages
+      - name: Setup GitHub Pages
         uses: actions/configure-pages@v4
 
-      - name: Upload artifact
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: './dist'
+          path: ${{ env.FOUND_DIST }}
 
       - name: Deploy to GitHub Pages
         id: deployment

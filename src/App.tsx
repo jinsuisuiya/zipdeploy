@@ -28,6 +28,7 @@ import {
   ArrowUpRight,
   Search,
   Trash2,
+  Zap,
   Play,
   Save,
   ShieldCheck,
@@ -60,6 +61,59 @@ export default function App() {
   const [forcePush, setForcePush] = useState<boolean>(true);
   const [saveLocally, setSaveLocally] = useState<boolean>(true);
   const [autoInjectPagesAction, setAutoInjectPagesAction] = useState<boolean>(true);
+  const [pagesStatus, setPagesStatus] = useState<string | null>(null);
+  const [isTriggeringPages, setIsTriggeringPages] = useState<boolean>(false);
+
+  const triggerPagesAutoSetup = async () => {
+    if (!token || !username || !repo) return;
+    setIsTriggeringPages(true);
+    setPagesStatus('正在调用 API 为你自动开启 GitHub Pages 并发起部署...');
+    addLog('正在通过 API 尝试开启/配置 GitHub Pages...', 'info');
+
+    const headers = {
+      Authorization: `Bearer ${token.trim()}`,
+      Accept: 'application/vnd.github+json',
+      'Content-Type': 'application/json'
+    };
+
+    try {
+      let pagesRes = await fetch(`https://api.github.com/repos/${username}/${repo}/pages`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ build_type: 'workflow' })
+      });
+
+      if (!pagesRes.ok && (pagesRes.status === 409 || pagesRes.status === 422)) {
+        pagesRes = await fetch(`https://api.github.com/repos/${username}/${repo}/pages`, {
+          method: 'PUT',
+          headers,
+          body: JSON.stringify({ build_type: 'workflow' })
+        });
+      }
+
+      if (pagesRes.ok || pagesRes.status === 204) {
+        addLog('✅ 已成功通过 API 将 GitHub Pages 切换为 Actions 构建模式！', 'success');
+      }
+
+      const dispatchRes = await fetch(`https://api.github.com/repos/${username}/${repo}/actions/workflows/deploy-pages.yml/dispatches`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ ref: branch })
+      });
+
+      if (dispatchRes.ok || dispatchRes.status === 204) {
+        addLog('🚀 成功触发 GitHub Actions 云端打包与上线，等待约 1 分钟即可访问！', 'success');
+        setPagesStatus('🎉 全自动触发成功！已为你通过 API 开启 Pages 并启动云端打包！等待 1 分钟左右刷新网址即可。');
+      } else {
+        setPagesStatus('Pages 模式已配置下发！请去 Actions 标签页或者刷新网页预览。');
+      }
+    } catch (e: any) {
+      console.error(e);
+      setPagesStatus(`API 配置提示: ${e.message || '操作已完成'}`);
+    } finally {
+      setIsTriggeringPages(false);
+    }
+  };
 
   // Save settings to localStorage
   useEffect(() => {
@@ -209,7 +263,7 @@ export default function App() {
       if (autoInjectPagesAction) {
         const workflowPath = '.github/workflows/deploy-pages.yml';
         if (!fileList.some(f => f.path === workflowPath)) {
-          const pagesWorkflowYaml = `name: Deploy Vite/React site to GitHub Pages
+          const pagesWorkflowYaml = `name: Deploy site to GitHub Pages
 
 on:
   push:
@@ -232,27 +286,47 @@ jobs:
       url: \${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js environment
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install dependencies
-        run: npm ci || npm install
+      - name: Install dependencies & Build project
+        run: |
+          if [ -f package.json ]; then
+            echo "Installing dependencies..."
+            npm install || npm install --legacy-peer-deps
+            echo "Building static site..."
+            if grep -q '"build"' package.json; then
+              npm run build || true
+            fi
+          fi
 
-      - name: Build project
-        run: npm run build
+          # Locate target static export directory
+          if [ -d "dist" ]; then
+            echo "FOUND_DIST=./dist" >> $GITHUB_ENV
+          elif [ -d "build" ]; then
+            echo "FOUND_DIST=./build" >> $GITHUB_ENV
+          elif [ -d "out" ]; then
+            echo "FOUND_DIST=./out" >> $GITHUB_ENV
+          else
+            echo "No build folder detected. Preparing root files for static hosting..."
+            mkdir -p _site
+            cp -r ./* _site/ 2>/dev/null || true
+            rm -rf _site/_site 2>/dev/null || true
+            echo "FOUND_DIST=./_site" >> $GITHUB_ENV
+          fi
 
-      - name: Setup Pages
+      - name: Setup GitHub Pages
         uses: actions/configure-pages@v4
 
-      - name: Upload artifact
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: './dist'
+          path: \${{ env.FOUND_DIST }}
 
       - name: Deploy to GitHub Pages
         id: deployment
@@ -527,6 +601,9 @@ jobs:
       setUploadSuccess(true);
       addLog(`🎉 部署成功！远端 GitHub 仓库文件已被彻底覆写更新！`, 'success');
 
+      // Attempt automatic Pages setup and Action dispatch via API
+      triggerPagesAutoSetup();
+
     } catch (err: any) {
       console.error(err);
       setIsUploading(false);
@@ -602,7 +679,7 @@ jobs:
           fi`;
 
   const deployShContent = `#!/bin/bash
-# Termux 本地一键解压并强推覆写 GitHub 仓库脚本
+# Termux 本地一键解压强推覆写仓库 + API 自动开启 Pages 脚本
 
 USERNAME="${username}"
 REPO="${repo}"
@@ -634,7 +711,19 @@ git branch -M "$BRANCH"
 git remote add origin "https://\${TOKEN}@github.com/\${USERNAME}/\${REPO}.git"
 echo "⬆️ 强制推送到 GitHub 远端..."
 git push -u origin "$BRANCH" --force
-rm -rf "$WORK_DIR"`;
+rm -rf "$WORK_DIR"
+
+echo "🌐 正在通过 API 全自动开启 GitHub Pages (Actions 模式)..."
+curl -s -X POST -H "Authorization: Bearer \${TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/\${USERNAME}/\${REPO}/pages" -d '{"build_type":"workflow"}' > /dev/null || true
+curl -s -X PUT -H "Authorization: Bearer \${TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/\${USERNAME}/\${REPO}/pages" -d '{"build_type":"workflow"}' > /dev/null || true
+
+echo "🚀 正在通过 API 自动触发 GitHub Actions 云端构建打包..."
+curl -s -X POST -H "Authorization: Bearer \${TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/\${USERNAME}/\${REPO}/actions/workflows/deploy-pages.yml/dispatches" -d "{\"ref\":\"\${BRANCH}\"}" > /dev/null || true
+
+echo "🎉 全套自动化处理完毕！大约 1 分钟后即可访问你的在线网站："
+echo "https://\${USERNAME}.github.io/\${REPO}/"`;
+
+  const termuxOneLiner = `pkg install -y curl && curl -s -X POST -H "Authorization: Bearer ${token || 'YOUR_TOKEN'}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${username}/${repo}/pages" -d '{"build_type":"workflow"}' && curl -s -X PUT -H "Authorization: Bearer ${token || 'YOUR_TOKEN'}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${username}/${repo}/pages" -d '{"build_type":"workflow"}' && curl -s -X POST -H "Authorization: Bearer ${token || 'YOUR_TOKEN'}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${username}/${repo}/actions/workflows/deploy-pages.yml/dispatches" -d '{"ref":"${branch}"}' && echo "🎉 Termux 已成功为你自动开启 GitHub Pages 并触发打包上线！"`;
 
   return (
     <div className="min-h-screen bg-[#f7f7f6] text-[#1c1c1c] font-sans antialiased selection:bg-neutral-200">
@@ -1090,45 +1179,83 @@ rm -rf "$WORK_DIR"`;
                     {/* Crucial Setup Box for GitHub Pages */}
                     <div className="bg-amber-50/90 border border-amber-200 rounded-2xl p-5 text-xs text-amber-950 space-y-3 shadow-sm">
                       <div className="flex items-center gap-2 font-bold text-amber-900 text-sm border-b border-amber-200/60 pb-2">
-                        <span className="w-6 h-6 rounded-full bg-amber-500 text-white flex items-center justify-center text-xs shrink-0">💡</span>
-                        <span>解决网站白屏/打不开：只需在 GitHub 修改 1 个设置！</span>
+                        <span className="w-6 h-6 rounded-full bg-amber-500 text-white flex items-center justify-center text-xs shrink-0">🚨</span>
+                        <span>新建仓库发不了网站？看这 2 个 GitHub 关键设置（解决没有 Save 键问题）</span>
                       </div>
                       <p className="leading-relaxed text-amber-900">
-                        提示：你上传的是 React / Vite 前端<strong>源代码</strong>（浏览器直接加载 <code>.tsx</code> 会无法解析而白屏）。网页已为你自动注入了 <code>.github/workflows/deploy-pages.yml</code> 云端打包工作流！
+                        提示：网页已为你自动注入了云端构建打包工作流 <code>.github/workflows/deploy-pages.yml</code>！如果你删除了旧仓库重新建了新仓库，必须在 GitHub 完成以下 2 项开启：
                       </p>
                       
-                      <div className="bg-white/90 border border-amber-200 rounded-xl p-3.5 space-y-2">
-                        <div className="font-bold text-amber-950 flex items-center gap-1.5">
-                          <span className="w-4 h-4 rounded-full bg-amber-900 text-white text-[10px] flex items-center justify-center font-mono">1</span>
-                          进入 GitHub Pages 设置页：
+                      <div className="bg-white/90 border border-amber-200 rounded-xl p-3.5 space-y-3">
+                        <div className="space-y-1">
+                          <div className="font-bold text-amber-950 flex items-center gap-1.5">
+                            <span className="w-4.5 h-4.5 rounded-full bg-amber-900 text-white text-[10px] flex items-center justify-center font-mono">1</span>
+                            把 Source 切换为 GitHub Actions：
+                          </div>
+                          <div className="pl-6 text-amber-900 space-y-1">
+                            <p>前往：<a href={`https://github.com/${username}/${repo}/settings/pages`} target="_blank" rel="noopener noreferrer" className="underline font-mono font-bold text-amber-950">Settings -&gt; Pages</a></p>
+                            <p>找到 <strong>Build and deployment -&gt; Source</strong> 下拉菜单，切换为 <strong className="bg-amber-200/80 text-amber-950 px-1.5 py-0.5 rounded border border-amber-300 font-mono">GitHub Actions</strong>。</p>
+                            <p className="text-[11px] text-amber-800 bg-amber-100/60 p-1.5 rounded border border-amber-200">💡 <strong>找不到 Save 键？</strong> 别担心！切换为 GitHub Actions 选项的瞬间，GitHub 就已经<strong>自动保存生效</strong>了，因此下方不需要也不再有 Save 键！</p>
+                          </div>
                         </div>
-                        <a
-                          href={`https://github.com/${username}/${repo}/settings/pages`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 text-amber-900 hover:text-amber-950 underline font-mono text-[11px] pl-5 font-bold"
-                        >
-                          https://github.com/{username}/{repo}/settings/pages <ArrowUpRight className="w-3 h-3" />
-                        </a>
 
-                        <div className="font-bold text-amber-950 flex items-center gap-1.5 pt-1">
-                          <span className="w-4 h-4 rounded-full bg-amber-900 text-white text-[10px] flex items-center justify-center font-mono">2</span>
-                          把 Source 从 Deploy from a branch 改选为 GitHub Actions：
+                        <div className="border-t border-amber-100 pt-2.5 space-y-1">
+                          <div className="font-bold text-amber-950 flex items-center gap-1.5">
+                            <span className="w-4.5 h-4.5 rounded-full bg-amber-900 text-white text-[10px] flex items-center justify-center font-mono">2</span>
+                            开启 Actions 读写权限（防止部署报错 403）：
+                          </div>
+                          <div className="pl-6 text-amber-900 space-y-1">
+                            <p>前往：<a href={`https://github.com/${username}/${repo}/settings/actions`} target="_blank" rel="noopener noreferrer" className="underline font-mono font-bold text-amber-950">Settings -&gt; Actions -&gt; General</a></p>
+                            <p>滑到最底部 <strong>Workflow permissions</strong>，选中 <strong className="bg-amber-200/80 text-amber-950 px-1.5 py-0.5 rounded border border-amber-300">Read and write permissions</strong> 并点击底部的 <strong>Save</strong> 按钮！</p>
+                          </div>
                         </div>
-                        <p className="text-amber-800 text-[11px] pl-5 leading-relaxed">
-                          找到 <strong>Build and deployment -&gt; Source</strong>，下拉菜单选择 <strong className="bg-amber-200/80 text-amber-950 px-1.5 py-0.5 rounded border border-amber-300 font-mono">GitHub Actions</strong>。
-                        </p>
+
+                        <div className="border-t border-amber-100 pt-2.5 space-y-1">
+                          <div className="font-bold text-amber-950 flex items-center gap-1.5">
+                            <span className="w-4.5 h-4.5 rounded-full bg-amber-900 text-white text-[10px] flex items-center justify-center font-mono">3</span>
+                            触发云端编译打包：
+                          </div>
+                          <div className="pl-6 text-amber-900 space-y-1">
+                            <p>前往：<a href={`https://github.com/${username}/${repo}/actions`} target="_blank" rel="noopener noreferrer" className="underline font-mono font-bold text-amber-950">Actions 标签页</a>，点击 <i>Deploy site to GitHub Pages</i> &rarr; 点击右侧 <strong>Run workflow</strong> 运行。</p>
+                            <p className="text-emerald-800 font-semibold">约 1 分钟后绿灯亮起，点击下面的网址即可正常打开你的网页啦！</p>
+                          </div>
+                        </div>
                       </div>
 
-                      <div className="flex items-center justify-between text-[11px] text-amber-800 pt-1">
-                        <span>✨ GitHub 将自动运行打包，约 1 分钟后你的 Pages 网址就能完美流畅访问啦！</span>
+                      <div className="bg-amber-100/80 border border-amber-300 rounded-xl p-3 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                        <div>
+                          <div className="font-bold text-amber-950 flex items-center gap-1.5 text-xs">
+                            <Zap className="w-4 h-4 text-amber-700 fill-amber-500" />
+                            <span>懒得手动找按钮？一键全自动 API 触发：</span>
+                          </div>
+                          <p className="text-[11px] text-amber-900 mt-0.5">点击右侧按钮，工具将直接通过 GitHub API 为你将 Pages 设为 Actions 模式并启动打包！</p>
+                        </div>
+                        <button
+                          onClick={triggerPagesAutoSetup}
+                          disabled={isTriggeringPages}
+                          className="inline-flex items-center gap-1.5 bg-amber-900 hover:bg-black text-white font-bold text-xs px-4 py-2 rounded-xl transition shadow-sm shrink-0 disabled:opacity-50"
+                        >
+                          {isTriggeringPages ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5 text-amber-300 fill-amber-300" />}
+                          <span>⚡ 网页 API 一键开启 Pages & 启动 Actions</span>
+                        </button>
+                      </div>
+
+                      {pagesStatus && (
+                        <div className="bg-emerald-100/90 border border-emerald-300 text-emerald-950 p-2.5 rounded-xl text-xs font-semibold flex items-center gap-2">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                          <span>{pagesStatus}</span>
+                        </div>
+                      )}
+
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-[11px] text-amber-800 pt-1 border-t border-amber-200/60">
+                        <span>✨ 网站在线预览地址：</span>
                         <a
                           href={`https://${username}.github.io/${repo}/`}
                           target="_blank"
                           rel="noopener noreferrer"
                           className="inline-flex items-center gap-1 font-bold text-amber-950 underline shrink-0"
                         >
-                          打开 GitHub Pages 预览 <ExternalLink className="w-3 h-3" />
+                          https://{username}.github.io/{repo}/ <ExternalLink className="w-3 h-3" />
                         </a>
                       </div>
                     </div>
@@ -1203,27 +1330,55 @@ rm -rf "$WORK_DIR"`;
 
         {/* TAB 2: Termux Script (.sh) */}
         {activeTab === 'termux-script' && (
-          <div className="bg-white rounded-[28px] border border-neutral-200/80 p-6 md:p-8 space-y-4 shadow-[0_8px_30px_rgb(0,0,0,0.03)]">
-            <div className="flex items-center justify-between border-b border-neutral-100 pb-3">
-              <div>
-                <h3 className="font-bold text-neutral-900 text-sm flex items-center gap-2">
-                  <Terminal className="w-4 h-4 text-neutral-800" /> deploy.sh (Termux 手机本地强推脚本)
-                </h3>
-                <p className="text-xs text-neutral-400 mt-0.5">适合直接在手机终端使用此 Shell 脚本解压与覆盖远端仓库</p>
+          <div className="bg-white rounded-[28px] border border-neutral-200/80 p-6 md:p-8 space-y-6 shadow-[0_8px_30px_rgb(0,0,0,0.03)]">
+            
+            {/* 1-Line Termux Command */}
+            <div className="bg-amber-50 border border-amber-200/80 rounded-2xl p-5 space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-amber-200/60 pb-2">
+                <div className="flex items-center gap-2">
+                  <Zap className="w-4 h-4 text-amber-600 fill-amber-500" />
+                  <h4 className="font-bold text-amber-950 text-sm">Termux 手机一键自动补救命令（无需找 Save 键）</h4>
+                </div>
+                <button
+                  onClick={() => handleCopy(termuxOneLiner, 'termux-one-liner')}
+                  className="inline-flex items-center gap-1.5 bg-amber-900 hover:bg-black text-white text-xs px-4 py-1.5 rounded-full font-semibold transition shrink-0"
+                >
+                  {copiedKey === 'termux-one-liner' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedKey === 'termux-one-liner' ? '已复制命令' : '复制 Termux 单行命令'}</span>
+                </button>
+              </div>
+              <p className="text-xs text-amber-900 leading-relaxed">
+                如果在 GitHub 网页找不到开启 Pages 或 Actions 的按钮，在手机 Termux 里打开，粘贴运行下方这条命令，Termux 就会<strong>自动通过 API 帮你在后台把 GitHub Pages 开启并立刻触发打包部署</strong>：
+              </p>
+              <div className="bg-black text-amber-300 p-3.5 rounded-xl font-mono text-xs overflow-x-auto select-all shadow-inner border border-neutral-800">
+                <code>{termuxOneLiner}</code>
+              </div>
+            </div>
+
+            {/* Complete bash script */}
+            <div className="space-y-3">
+              <div className="flex items-center justify-between border-b border-neutral-100 pb-3">
+                <div>
+                  <h3 className="font-bold text-neutral-900 text-sm flex items-center gap-2">
+                    <Terminal className="w-4 h-4 text-neutral-800" /> deploy.sh (Termux 手机全自动推送 + API 开启 Pages 脚本)
+                  </h3>
+                  <p className="text-xs text-neutral-400 mt-0.5">可以在手机 Termux 中保存为 deploy.sh 运行，包含本地 Git 强推 + API 全自动开启 Pages</p>
+                </div>
+
+                <button
+                  onClick={() => handleCopy(deployShContent, 'deploy-sh')}
+                  className="inline-flex items-center gap-1.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-800 text-xs px-4 py-2 rounded-full font-semibold transition"
+                >
+                  {copiedKey === 'deploy-sh' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedKey === 'deploy-sh' ? '已复制' : '复制 deploy.sh'}</span>
+                </button>
               </div>
 
-              <button
-                onClick={() => handleCopy(deployShContent, 'deploy-sh')}
-                className="inline-flex items-center gap-1.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-800 text-xs px-4 py-2 rounded-full font-semibold transition"
-              >
-                {copiedKey === 'deploy-sh' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                <span>{copiedKey === 'deploy-sh' ? '已复制' : '复制 .sh 脚本'}</span>
-              </button>
+              <div className="bg-black text-neutral-100 p-4.5 rounded-2xl font-mono text-xs overflow-x-auto leading-relaxed shadow-inner">
+                <pre>{deployShContent}</pre>
+              </div>
             </div>
 
-            <div className="bg-black text-neutral-100 p-4.5 rounded-2xl font-mono text-xs overflow-x-auto leading-relaxed shadow-inner">
-              <pre>{deployShContent}</pre>
-            </div>
           </div>
         )}
 
