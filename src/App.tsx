@@ -59,6 +59,7 @@ export default function App() {
   const [commitMessage, setCommitMessage] = useState<string>('refactor: auto deploy unzipped contents');
   const [forcePush, setForcePush] = useState<boolean>(true);
   const [saveLocally, setSaveLocally] = useState<boolean>(true);
+  const [autoInjectPagesAction, setAutoInjectPagesAction] = useState<boolean>(true);
 
   // Save settings to localStorage
   useEffect(() => {
@@ -202,6 +203,70 @@ export default function App() {
           isDir: false,
           content: contentUint8
         });
+      }
+
+      // Auto inject GitHub Pages build & deploy workflow for React/Vite source projects
+      if (autoInjectPagesAction) {
+        const workflowPath = '.github/workflows/deploy-pages.yml';
+        if (!fileList.some(f => f.path === workflowPath)) {
+          const pagesWorkflowYaml = `name: Deploy Vite/React site to GitHub Pages
+
+on:
+  push:
+    branches: ['main', 'master']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: 'pages'
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    environment:
+      name: github-pages
+      url: \${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Build project
+        run: npm run build
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './dist'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4`;
+
+          const encoder = new TextEncoder();
+          const bytes = encoder.encode(pagesWorkflowYaml);
+          fileList.push({
+            path: workflowPath,
+            size: bytes.byteLength,
+            isDir: false,
+            content: bytes
+          });
+        }
       }
 
       setExtractedFiles(fileList);
@@ -809,8 +874,8 @@ rm -rf "$WORK_DIR"`;
             </div>
           </div>
 
-          <div className="pt-3 border-t border-neutral-100 flex flex-col sm:flex-row sm:items-center justify-between text-xs gap-2">
-            <div className="flex items-center gap-4">
+          <div className="pt-3 border-t border-neutral-100 flex flex-col sm:flex-row sm:items-center justify-between text-xs gap-3">
+            <div className="flex flex-wrap items-center gap-4">
               <label className="flex items-center gap-2 cursor-pointer select-none">
                 <input
                   type="checkbox"
@@ -821,6 +886,16 @@ rm -rf "$WORK_DIR"`;
                 <span className="font-bold text-neutral-900">
                   强制清空重置远端仓库 (--force overwrite)
                 </span>
+              </label>
+
+              <label className="flex items-center gap-2 cursor-pointer select-none text-neutral-800 font-medium">
+                <input
+                  type="checkbox"
+                  checked={autoInjectPagesAction}
+                  onChange={(e) => setAutoInjectPagesAction(e.target.checked)}
+                  className="w-4 h-4 accent-neutral-900 rounded border-neutral-300"
+                />
+                <span>自动注入 Pages 自动编译工作流 (.yml)</span>
               </label>
 
               <label className="flex items-center gap-1.5 cursor-pointer select-none text-neutral-500">
@@ -996,19 +1071,67 @@ rm -rf "$WORK_DIR"`;
 
                 {/* Success Banner */}
                 {uploadSuccess && (
-                  <div className="bg-emerald-50 border border-emerald-200 text-emerald-900 p-4.5 rounded-2xl flex items-center justify-between text-xs">
-                    <div className="flex items-center gap-2 font-semibold">
-                      <CheckCircle2 className="w-4.5 h-4.5 text-emerald-600 shrink-0" />
-                      <span>代码已成功推送！远端 GitHub 仓库文件已被彻底覆写更新！</span>
+                  <div className="space-y-4">
+                    <div className="bg-emerald-50 border border-emerald-200 text-emerald-900 p-4.5 rounded-2xl flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-2 font-semibold">
+                        <CheckCircle2 className="w-4.5 h-4.5 text-emerald-600 shrink-0" />
+                        <span>代码已成功推送！远端 GitHub 仓库文件已被彻底覆写更新！</span>
+                      </div>
+                      <a
+                        href={`https://github.com/${username}/${repo}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="underline font-bold hover:text-emerald-950 flex items-center gap-1 shrink-0"
+                      >
+                        前往查看仓库 <ExternalLink className="w-3 h-3" />
+                      </a>
                     </div>
-                    <a
-                      href={`https://github.com/${username}/${repo}`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="underline font-bold hover:text-emerald-950 flex items-center gap-1"
-                    >
-                      前往查看仓库 <ExternalLink className="w-3 h-3" />
-                    </a>
+
+                    {/* Crucial Setup Box for GitHub Pages */}
+                    <div className="bg-amber-50/90 border border-amber-200 rounded-2xl p-5 text-xs text-amber-950 space-y-3 shadow-sm">
+                      <div className="flex items-center gap-2 font-bold text-amber-900 text-sm border-b border-amber-200/60 pb-2">
+                        <span className="w-6 h-6 rounded-full bg-amber-500 text-white flex items-center justify-center text-xs shrink-0">💡</span>
+                        <span>解决网站白屏/打不开：只需在 GitHub 修改 1 个设置！</span>
+                      </div>
+                      <p className="leading-relaxed text-amber-900">
+                        提示：你上传的是 React / Vite 前端<strong>源代码</strong>（浏览器直接加载 <code>.tsx</code> 会无法解析而白屏）。网页已为你自动注入了 <code>.github/workflows/deploy-pages.yml</code> 云端打包工作流！
+                      </p>
+                      
+                      <div className="bg-white/90 border border-amber-200 rounded-xl p-3.5 space-y-2">
+                        <div className="font-bold text-amber-950 flex items-center gap-1.5">
+                          <span className="w-4 h-4 rounded-full bg-amber-900 text-white text-[10px] flex items-center justify-center font-mono">1</span>
+                          进入 GitHub Pages 设置页：
+                        </div>
+                        <a
+                          href={`https://github.com/${username}/${repo}/settings/pages`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-amber-900 hover:text-amber-950 underline font-mono text-[11px] pl-5 font-bold"
+                        >
+                          https://github.com/{username}/{repo}/settings/pages <ArrowUpRight className="w-3 h-3" />
+                        </a>
+
+                        <div className="font-bold text-amber-950 flex items-center gap-1.5 pt-1">
+                          <span className="w-4 h-4 rounded-full bg-amber-900 text-white text-[10px] flex items-center justify-center font-mono">2</span>
+                          把 Source 从 Deploy from a branch 改选为 GitHub Actions：
+                        </div>
+                        <p className="text-amber-800 text-[11px] pl-5 leading-relaxed">
+                          找到 <strong>Build and deployment -&gt; Source</strong>，下拉菜单选择 <strong className="bg-amber-200/80 text-amber-950 px-1.5 py-0.5 rounded border border-amber-300 font-mono">GitHub Actions</strong>。
+                        </p>
+                      </div>
+
+                      <div className="flex items-center justify-between text-[11px] text-amber-800 pt-1">
+                        <span>✨ GitHub 将自动运行打包，约 1 分钟后你的 Pages 网址就能完美流畅访问啦！</span>
+                        <a
+                          href={`https://${username}.github.io/${repo}/`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 font-bold text-amber-950 underline shrink-0"
+                        >
+                          打开 GitHub Pages 预览 <ExternalLink className="w-3 h-3" />
+                        </a>
+                      </div>
+                    </div>
                   </div>
                 )}
 
@@ -1160,7 +1283,17 @@ rm -rf "$WORK_DIR"`;
               </div>
 
               <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
-                <h4 className="font-bold text-neutral-900 text-xs md:text-sm">4. 以后开源代码需要注意什么？</h4>
+                <h4 className="font-bold text-neutral-900 text-xs md:text-sm">4. 为什么用 GitHub 链接打开网页会“白屏”？</h4>
+                <div className="text-neutral-500 text-xs leading-relaxed space-y-1.5">
+                  <p>主要有两个常见原因：</p>
+                  <p><strong>原因 ①：直接点击了仓库中的 index.html 源码链接。</strong><br />GitHub 代码页面（如 <code className="bg-white border px-1 py-0.5 rounded font-mono">github.com/xxx/xxx/blob/main/index.html</code>）只是源码查看器，不会运行 JS 脚本。你需要开启 <strong>GitHub Pages</strong> 才能生成预览网站！</p>
+                  <p><strong>如何在 GitHub 开启网页预览：</strong><br />进入 GitHub 目标仓库 -&gt; 点击 <strong>Settings</strong> -&gt; 左侧边栏 <strong>Pages</strong> -&gt; Source 选择 <strong>Deploy from a branch</strong>，Branch 选择 <strong>main</strong> / <strong>/ (root)</strong> 点击 Save。等 1 分钟后即可获得专属网址（如 <code className="bg-white border px-1 py-0.5 rounded font-mono">https://yourname.github.io/repo/</code>）。</p>
+                  <p><strong>原因 ②：静态资源路径 404 报错。</strong><br />传统打包默认使用绝对路径 <code className="bg-white border px-1 py-0.5 rounded font-mono">/assets/</code>，导致在 GitHub Pages 的子路径下找不到脚本。本项目已在配置中设置了 <code className="bg-white border px-1 py-0.5 rounded font-mono">base: './'</code> 相对路径，全量兼容 GitHub Pages 部署！</p>
+                </div>
+              </div>
+
+              <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
+                <h4 className="font-bold text-neutral-900 text-xs md:text-sm">5. 以后开源代码需要注意什么？</h4>
                 <p className="text-neutral-500 text-xs leading-relaxed">
                   本网页完全由纯前端运行（基于 GitHub 官方公开 REST API），你的 Token 只存在于你自己的浏览器内存中，绝对不会上传到任何中间服务器，你可以非常放心、安全地把本项目仓库开源或者分享给朋友使用！
                 </p>
