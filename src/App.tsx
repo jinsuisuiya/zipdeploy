@@ -38,7 +38,7 @@ interface ExtractedFile {
   path: string;
   size: number;
   isDir: boolean;
-  contentPromise: () => Promise<Uint8Array>;
+  content: Uint8Array;
 }
 
 interface UploadLog {
@@ -180,26 +180,29 @@ export default function App() {
         }
       }
 
-      zipContent.forEach((relativePath, zipEntry) => {
-        if (zipEntry.dir) return;
+      for (const relativePath of Object.keys(zipContent.files)) {
+        const zipEntry = zipContent.files[relativePath];
+        if (zipEntry.dir) continue;
 
         // Ignore macOS and system meta files
-        if (relativePath.includes('__MACOSX/') || relativePath.endsWith('.DS_Store')) return;
+        if (relativePath.includes('__MACOSX/') || relativePath.endsWith('.DS_Store')) continue;
 
         let cleanPath = relativePath;
         if (rootPrefix && cleanPath.startsWith(rootPrefix)) {
           cleanPath = cleanPath.substring(rootPrefix.length);
         }
 
-        if (!cleanPath) return;
+        if (!cleanPath) continue;
+
+        const contentUint8 = await zipEntry.async('uint8array');
 
         fileList.push({
           path: cleanPath,
-          size: (zipEntry as any)._data?.uncompressedSize || 0,
+          size: contentUint8.byteLength,
           isDir: false,
-          contentPromise: () => zipEntry.async('uint8array')
+          content: contentUint8
         });
-      });
+      }
 
       setExtractedFiles(fileList);
       setIsUnzipping(false);
@@ -210,12 +213,14 @@ export default function App() {
     }
   };
 
-  // Convert Uint8Array to Base64
+  // Convert Uint8Array to Base64 safely without stack overflow
   const uint8ToBase64 = (uint8: Uint8Array): string => {
     let binary = '';
-    const len = uint8.byteLength;
-    for (let i = 0; i < len; i++) {
-      binary += String.fromCharCode(uint8[i]);
+    const len = uint8.length;
+    const chunkSize = 8192;
+    for (let i = 0; i < len; i += chunkSize) {
+      const chunk = uint8.subarray(i, Math.min(i + chunkSize, len));
+      binary += String.fromCharCode.apply(null, chunk as any);
     }
     return btoa(binary);
   };
@@ -262,7 +267,39 @@ export default function App() {
         parentCommitSha = refData.object.sha;
         addLog(`成功获取 HEAD 提交: ${parentCommitSha?.substring(0, 7)}`, 'success');
       } else {
-        addLog(`未找到现存 ${branch} 分支，将建立全新初始提交`, 'info');
+        addLog(`未找到现存 ${branch} 分支，准备初始化创建...`, 'info');
+      }
+
+      // If parentCommitSha is null (empty repo or non-existent branch), initialize via Contents API
+      if (!parentCommitSha) {
+        addLog(`检测到目标仓库为空 (0 提交)，正在自动初始化首个 Commit 节点...`, 'info');
+        setCurrentStepText('正在自动建立仓库初始提交...');
+
+        const initUrl = `https://api.github.com/repos/${username}/${repo}/contents/.gitkeep`;
+        const initRes = await fetch(initUrl, {
+          method: 'PUT',
+          headers,
+          body: JSON.stringify({
+            message: commitMessage || 'initial commit',
+            content: btoa('# Initialized by ZipDeploy'),
+            branch: branch
+          })
+        });
+
+        if (!initRes.ok) {
+          const errData = await initRes.json().catch(() => ({}));
+          throw new Error(`初始化空仓库失败: ${errData.message || initRes.statusText}`);
+        }
+
+        // Refetch HEAD ref
+        const newRefRes = await fetch(refUrl, { headers });
+        if (newRefRes.ok) {
+          const newRefData = await newRefRes.json();
+          parentCommitSha = newRefData.object.sha;
+          addLog(`空仓库自动初始化成功！已获得基准 Commit: ${parentCommitSha?.substring(0, 7)}`, 'success');
+        } else {
+          throw new Error('初始化仓库后无法获取分支引用，请检查 Token 权限与分支名');
+        }
       }
 
       setUploadProgress(15);
@@ -273,11 +310,10 @@ export default function App() {
 
       for (let i = 0; i < extractedFiles.length; i++) {
         const file = extractedFiles[i];
-        const contentUint8 = await file.contentPromise();
-        const base64Content = uint8ToBase64(contentUint8);
+        const base64Content = uint8ToBase64(file.content);
 
         const blobUrl = `https://api.github.com/repos/${username}/${repo}/git/blobs`;
-        const blobRes = await fetch(blobUrl, {
+        let blobRes = await fetch(blobUrl, {
           method: 'POST',
           headers,
           body: JSON.stringify({
@@ -285,6 +321,34 @@ export default function App() {
             encoding: 'base64'
           })
         });
+
+        // Fail-safe handling if Git repository is empty
+        if (!blobRes.ok) {
+          const errData = await blobRes.json().catch(() => ({}));
+          if (errData.message && errData.message.includes('Git Repository is empty')) {
+            addLog(`检测到 Git 数据库仍处于未初始化状态，再次初始化基础节点...`, 'info');
+            const initUrl = `https://api.github.com/repos/${username}/${repo}/contents/.gitkeep`;
+            await fetch(initUrl, {
+              method: 'PUT',
+              headers,
+              body: JSON.stringify({
+                message: commitMessage || 'initial commit',
+                content: btoa('# Initialized by ZipDeploy'),
+                branch: branch
+              })
+            });
+
+            // Retry blob upload
+            blobRes = await fetch(blobUrl, {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({
+                content: base64Content,
+                encoding: 'base64'
+              })
+            });
+          }
+        }
 
         if (!blobRes.ok) {
           const errData = await blobRes.json().catch(() => ({}));
@@ -373,7 +437,7 @@ export default function App() {
       });
 
       if (!updateRefRes.ok) {
-        if (updateRefRes.status === 404) {
+        if (updateRefRes.status === 404 || updateRefRes.status === 409 || updateRefRes.status === 422) {
           const createRefUrl = `https://api.github.com/repos/${username}/${repo}/git/refs`;
           const createRefRes = await fetch(createRefUrl, {
             method: 'POST',
@@ -1089,7 +1153,14 @@ rm -rf "$WORK_DIR"`;
               </div>
 
               <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
-                <h4 className="font-bold text-neutral-900 text-xs md:text-sm">3. 以后开源代码需要注意什么？</h4>
+                <h4 className="font-bold text-neutral-900 text-xs md:text-sm">3. 提示 "Git Repository is empty" 是什么意思？</h4>
+                <p className="text-neutral-500 text-xs leading-relaxed">
+                  这意味着你在 GitHub 上新建的仓库是**完全空白**的（没有勾选 "Add a README file"，里面 0 个 commit，连 <code className="bg-white border px-1 py-0.5 rounded font-mono">main</code> 默认分支都还没建立）。不用担心，直接用本网页拖入 ZIP 点击全量上传，系统会自动帮你建立初始提交并创建好 <code className="bg-white border px-1 py-0.5 rounded font-mono">main</code> 分支！
+                </p>
+              </div>
+
+              <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
+                <h4 className="font-bold text-neutral-900 text-xs md:text-sm">4. 以后开源代码需要注意什么？</h4>
                 <p className="text-neutral-500 text-xs leading-relaxed">
                   本网页完全由纯前端运行（基于 GitHub 官方公开 REST API），你的 Token 只存在于你自己的浏览器内存中，绝对不会上传到任何中间服务器，你可以非常放心、安全地把本项目仓库开源或者分享给朋友使用！
                 </p>
