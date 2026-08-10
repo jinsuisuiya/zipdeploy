@@ -364,6 +364,20 @@ jobs:
     return btoa(binary);
   };
 
+  // Helper to extract detailed GitHub API error messages
+  const formatApiError = (errData: any, fallbackMessage: string): string => {
+    if (errData && errData.errors && Array.isArray(errData.errors) && errData.errors.length > 0) {
+      const details = errData.errors.map((e: any) => {
+        if (typeof e === 'string') return e;
+        if (e.message) return e.message;
+        if (e.field) return `${e.field}: ${e.code || 'invalid'}`;
+        return JSON.stringify(e);
+      }).join(', ');
+      return `${errData.message || fallbackMessage} (${details})`;
+    }
+    return errData?.message || fallbackMessage;
+  };
+
   // Direct GitHub REST API Deployment
   const handleUploadToGithub = async () => {
     const cleanToken = token.trim();
@@ -427,7 +441,7 @@ jobs:
 
         if (!initRes.ok) {
           const errData = await initRes.json().catch(() => ({}));
-          throw new Error(`初始化空仓库失败: ${errData.message || initRes.statusText}`);
+          throw new Error(`初始化空仓库失败: ${formatApiError(errData, initRes.statusText)}`);
         }
 
         // Refetch HEAD ref
@@ -491,7 +505,7 @@ jobs:
 
         if (!blobRes.ok) {
           const errData = await blobRes.json().catch(() => ({}));
-          throw new Error(`文件 [${file.path}] Blob 上传失败: ${errData.message || blobRes.statusText}`);
+          throw new Error(`文件 [${file.path}] Blob 上传失败: ${formatApiError(errData, blobRes.statusText)}`);
         }
 
         const blobData = await blobRes.json();
@@ -527,7 +541,7 @@ jobs:
 
       if (!treeRes.ok) {
         const errData = await treeRes.json().catch(() => ({}));
-        throw new Error(`创建 Git Tree 目录节点失败: ${errData.message || treeRes.statusText}`);
+        throw new Error(`创建 Git Tree 目录节点失败: ${formatApiError(errData, treeRes.statusText)}`);
       }
 
       const treeData = await treeRes.json();
@@ -537,26 +551,56 @@ jobs:
       // 4. Create Commit
       setCurrentStepText('正在生成 Commit 提交对象...');
       const commitUrl = `https://api.github.com/repos/${username}/${repo}/git/commits`;
-      const commitBody = {
-        message: commitMessage || 'refactor: auto deploy unzipped contents',
+      
+      const cleanEmail = (email && email.trim().includes('@'))
+        ? email.trim()
+        : `${username.trim() || 'user'}@users.noreply.github.com`;
+      const cleanName = username.trim() || 'ZipDeploy User';
+
+      const commitBody: any = {
+        message: commitMessage.trim() || 'refactor: auto deploy unzipped contents',
         tree: treeData.sha,
         parents: parentCommitSha ? [parentCommitSha] : [],
         author: {
-          name: username,
-          email: email,
+          name: cleanName,
+          email: cleanEmail,
           date: new Date().toISOString()
         }
       };
 
-      const commitRes = await fetch(commitUrl, {
+      let commitRes = await fetch(commitUrl, {
         method: 'POST',
         headers,
         body: JSON.stringify(commitBody)
       });
 
+      // Fail-safe auto-retry if 422 Validation Failed occurs
+      if (!commitRes.ok && commitRes.status === 422) {
+        addLog('⚠️ 第一次创建 Commit 触发 422 校验机制，正在自动重试 (省略自定义 Author 属性)...', 'info');
+        
+        // Retry Attempt 1: Omit custom author object (let GitHub API use token user's defaults)
+        delete commitBody.author;
+        commitRes = await fetch(commitUrl, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(commitBody)
+        });
+
+        // Retry Attempt 2: If still failing and parents is non-empty, try root commit (empty parents)
+        if (!commitRes.ok && commitRes.status === 422 && commitBody.parents && commitBody.parents.length > 0) {
+          addLog('⚠️ 仍处于 422 校验异常，尝试切换为独立 Root Commit 节点重试...', 'info');
+          commitBody.parents = [];
+          commitRes = await fetch(commitUrl, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(commitBody)
+          });
+        }
+      }
+
       if (!commitRes.ok) {
         const errData = await commitRes.json().catch(() => ({}));
-        throw new Error(`创建 Commit 记录失败: ${errData.message || commitRes.statusText}`);
+        throw new Error(`创建 Commit 记录失败: ${formatApiError(errData, commitRes.statusText)}`);
       }
 
       const commitData = await commitRes.json();
@@ -588,11 +632,11 @@ jobs:
           });
           if (!createRefRes.ok) {
             const errData = await createRefRes.json().catch(() => ({}));
-            throw new Error(`创建新分支 ${branch} 失败: ${errData.message || createRefRes.statusText}`);
+            throw new Error(`创建新分支 ${branch} 失败: ${formatApiError(errData, createRefRes.statusText)}`);
           }
         } else {
           const errData = await updateRefRes.json().catch(() => ({}));
-          throw new Error(`更新分支 ${branch} 引用失败: ${errData.message || updateRefRes.statusText}`);
+          throw new Error(`更新分支 ${branch} 引用失败: ${formatApiError(errData, updateRefRes.statusText)}`);
         }
       }
 
