@@ -239,8 +239,19 @@ export default function App() {
         const zipEntry = zipContent.files[relativePath];
         if (zipEntry.dir) continue;
 
-        // Ignore macOS and system meta files
-        if (relativePath.includes('__MACOSX/') || relativePath.endsWith('.DS_Store')) continue;
+        // Ignore macOS, Windows, and Git metadata junk files
+        const filename = relativePath.split('/').pop() || '';
+        if (
+          relativePath.includes('__MACOSX/') ||
+          relativePath.endsWith('.DS_Store') ||
+          filename === '.DS_Store' ||
+          filename === 'Thumbs.db' ||
+          filename === 'desktop.ini' ||
+          relativePath.startsWith('.git/') ||
+          relativePath.includes('/.git/')
+        ) {
+          continue;
+        }
 
         let cleanPath = relativePath;
         if (rootPrefix && cleanPath.startsWith(rootPrefix)) {
@@ -356,13 +367,16 @@ jobs:
   const uint8ToBase64 = (uint8: Uint8Array): string => {
     let binary = '';
     const len = uint8.length;
-    const chunkSize = 8192;
+    const chunkSize = 0x8000; // 32768 chunk size for high performance
     for (let i = 0; i < len; i += chunkSize) {
       const chunk = uint8.subarray(i, Math.min(i + chunkSize, len));
       binary += String.fromCharCode.apply(null, chunk as any);
     }
     return btoa(binary);
   };
+
+  // Cache for uploaded blob SHAs to support instant resumable upload
+  const blobShaCacheRef = useRef<Map<string, string>>(new Map());
 
   // Helper to extract detailed GitHub API error messages
   const formatApiError = (errData: any, fallbackMessage: string): string => {
@@ -375,7 +389,71 @@ jobs:
       }).join(', ');
       return `${errData.message || fallbackMessage} (${details})`;
     }
-    return errData?.message || fallbackMessage;
+    if (errData && errData.message) {
+      return errData.message;
+    }
+    return fallbackMessage;
+  };
+
+  // Resilient fetch with automatic retries, timeout, and rate-limit backoff
+  const robustFetch = async (
+    url: string,
+    options: RequestInit,
+    maxRetries = 4,
+    timeoutMs = 35000
+  ): Promise<Response> => {
+    let lastError: any = null;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const response = await fetch(url, {
+          ...options,
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
+        // Check for GitHub Rate Limit (403 secondary rate limit or 429)
+        if (response.status === 429 || (response.status === 403 && !response.ok)) {
+          const clone = response.clone();
+          const errJson = await clone.json().catch(() => ({}));
+          const isRateLimit = errJson?.message?.toLowerCase().includes('rate limit') ||
+                              errJson?.message?.toLowerCase().includes('abuse') ||
+                              errJson?.message?.toLowerCase().includes('secondary');
+
+          if (isRateLimit && attempt < maxRetries) {
+            const retryAfter = Number(response.headers.get('retry-after')) || (attempt * 2 + 1);
+            addLog(`⚠️ 触发 GitHub API 频率保护，智能等待 ${retryAfter} 秒后第 ${attempt} 次自动重试...`, 'info');
+            await new Promise(r => setTimeout(r, retryAfter * 1000));
+            continue;
+          }
+        }
+
+        // Server errors (500, 502, 503, 504) -> auto retry
+        if ([500, 502, 503, 504].includes(response.status) && attempt < maxRetries) {
+          addLog(`⚠️ GitHub 服务端返回 ${response.status}，等待 2 秒后第 ${attempt} 次自动重试...`, 'info');
+          await new Promise(r => setTimeout(r, 2000 * attempt));
+          continue;
+        }
+
+        return response;
+      } catch (err: any) {
+        clearTimeout(timeoutId);
+        lastError = err;
+        const isAbort = err.name === 'AbortError';
+        const msg = isAbort ? '请求超时 (35s)' : (err.message || '网络连接波动');
+        
+        if (attempt < maxRetries) {
+          const delay = attempt * 1500;
+          addLog(`⚠️ 网络连接波动 (${msg})，${(delay / 1000).toFixed(1)} 秒后第 ${attempt} 次自动重试...`, 'info');
+          await new Promise(r => setTimeout(r, delay));
+        }
+      }
+    }
+
+    throw lastError || new Error('网络请求多次重试失败，请检查网络或 GitHub 服务状态');
   };
 
   // Direct GitHub REST API Deployment
@@ -385,7 +463,17 @@ jobs:
       setUploadError('请先填入您的 GitHub Personal Access Token (PAT) 密钥');
       return;
     }
-    if (username === 'your-username' || repo === 'your-repository' || !username.trim() || !repo.trim()) {
+
+    let cleanUsername = username.trim().replace(/^https?:\/\/github\.com\//i, '').replace(/^\/+/, '').split('/')[0];
+    let cleanRepo = repo.trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/i, '').replace(/^\/+/, '');
+    if (cleanRepo.includes('/')) {
+      const parts = cleanRepo.split('/');
+      cleanUsername = parts[0];
+      cleanRepo = parts[1];
+    }
+    const cleanBranch = branch.trim() || 'main';
+
+    if (!cleanUsername || cleanUsername === 'your-username' || !cleanRepo || cleanRepo === 'your-repository') {
       setUploadError('请在上方填写您实际的 GitHub 用户名与仓库名称');
       return;
     }
@@ -397,7 +485,6 @@ jobs:
     setIsUploading(true);
     setUploadSuccess(false);
     setUploadError(null);
-    setLogs([]);
     setUploadProgress(5);
 
     const headers = {
@@ -407,137 +494,173 @@ jobs:
     };
 
     try {
-      addLog(`连接 GitHub 目标仓库: ${username}/${repo} (${branch} 分支)`, 'info');
+      addLog(`🚀 开始连接 GitHub 目标仓库: ${cleanUsername}/${cleanRepo} (${cleanBranch} 分支)`, 'info');
+
+      // 0. Pre-flight Check: Verify Token and Repository Access
+      setCurrentStepText('正在预检 GitHub 目标仓库访问权限...');
+      const repoUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}`;
+      const repoCheckRes = await robustFetch(repoUrl, { headers }, 2, 8000);
+      
+      if (!repoCheckRes.ok) {
+        if (repoCheckRes.status === 401) {
+          throw new Error('GitHub PAT Token 无效或已被撤销，请检查 Token 并重新输入');
+        } else if (repoCheckRes.status === 404) {
+          throw new Error(`未找到目标仓库 [${cleanUsername}/${cleanRepo}]。请检查：1. 用户名与仓库名拼写 2. 若为私有仓库，需确保 PAT Token 勾选了 repo 权限`);
+        } else if (repoCheckRes.status === 403) {
+          throw new Error('PAT Token 权限不足或被 GitHub 限流，请确认创建 Token 时勾选了 repo 读写权限');
+        }
+      } else {
+        const repoData = await repoCheckRes.json().catch(() => ({}));
+        if (repoData.private) {
+          addLog(`🔒 目标仓库为私有仓库 (Private Repo)，已确认 Access Token 权限有效`, 'info');
+        }
+      }
+
+      // Check for oversized files (> 50MB)
+      const oversized = extractedFiles.filter(f => f.size > 50 * 1024 * 1024);
+      if (oversized.length > 0) {
+        const names = oversized.map(f => f.path).join(', ');
+        addLog(`⚠️ 警告: 检测到大文件超过 50MB [${names}]，GitHub REST API 传输此类大文件可能失败`, 'info');
+      }
 
       // 1. Get HEAD ref
       setCurrentStepText('正在读取 GitHub 仓库分支 HEAD 状态...');
-      const refUrl = `https://api.github.com/repos/${username}/${repo}/git/ref/heads/${branch}`;
-      const refRes = await fetch(refUrl, { headers });
-
+      const refUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/ref/heads/${cleanBranch}`;
+      
       let parentCommitSha: string | null = null;
-      if (refRes.ok) {
-        const refData = await refRes.json();
-        parentCommitSha = refData.object.sha;
-        addLog(`成功获取 HEAD 提交: ${parentCommitSha?.substring(0, 7)}`, 'success');
-      } else {
-        addLog(`未找到现存 ${branch} 分支，准备初始化创建...`, 'info');
+      try {
+        const refRes = await robustFetch(refUrl, { headers }, 2, 10000);
+        if (refRes.ok) {
+          const refData = await refRes.json();
+          parentCommitSha = refData.object.sha;
+          addLog(`成功获取 HEAD 提交: ${parentCommitSha?.substring(0, 7)}`, 'success');
+        } else if (refRes.status === 404 || refRes.status === 409) {
+          addLog(`目标分支 ${cleanBranch} 不存在或仓库为空，准备自动创建初始节点...`, 'info');
+        }
+      } catch (err: any) {
+        addLog(`检查分支状态跳过 (将作为新提交处理): ${err.message || ''}`, 'info');
       }
 
       // If parentCommitSha is null (empty repo or non-existent branch), initialize via Contents API
       if (!parentCommitSha) {
-        addLog(`检测到目标仓库为空 (0 提交)，正在自动初始化首个 Commit 节点...`, 'info');
-        setCurrentStepText('正在自动建立仓库初始提交...');
+        addLog(`检测到目标仓库无基准提交，正在自动初始化首个 Commit 节点...`, 'info');
+        setCurrentStepText('正在建立仓库初始提交...');
 
-        const initUrl = `https://api.github.com/repos/${username}/${repo}/contents/.gitkeep`;
-        const initRes = await fetch(initUrl, {
+        const initUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/contents/.gitkeep`;
+        const initRes = await robustFetch(initUrl, {
           method: 'PUT',
           headers,
           body: JSON.stringify({
-            message: commitMessage || 'initial commit',
+            message: commitMessage.trim() || 'initial commit',
             content: btoa('# Initialized by ZipDeploy'),
-            branch: branch
+            branch: cleanBranch
           })
-        });
+        }, 3);
 
-        if (!initRes.ok) {
+        if (!initRes.ok && initRes.status !== 422) {
           const errData = await initRes.json().catch(() => ({}));
           throw new Error(`初始化空仓库失败: ${formatApiError(errData, initRes.statusText)}`);
         }
 
         // Refetch HEAD ref
-        const newRefRes = await fetch(refUrl, { headers });
-        if (newRefRes.ok) {
-          const newRefData = await newRefRes.json();
-          parentCommitSha = newRefData.object.sha;
-          addLog(`空仓库自动初始化成功！已获得基准 Commit: ${parentCommitSha?.substring(0, 7)}`, 'success');
-        } else {
-          throw new Error('初始化仓库后无法获取分支引用，请检查 Token 权限与分支名');
+        try {
+          const newRefRes = await robustFetch(refUrl, { headers }, 2, 10000);
+          if (newRefRes.ok) {
+            const newRefData = await newRefRes.json();
+            parentCommitSha = newRefData.object.sha;
+            addLog(`空仓库自动初始化成功！已获得基准 Commit: ${parentCommitSha?.substring(0, 7)}`, 'success');
+          }
+        } catch {
+          // ignore if new ref will be created in step 5
         }
       }
 
       setUploadProgress(15);
 
-      // 2. Upload Blobs
-      setCurrentStepText(`正在依次构建并上传 ${extractedFiles.length} 个文件数据...`);
+      // 2. Upload Blobs with Resumable Caching & Anti-Throttling Pacing
+      setCurrentStepText(`正在依次构建并上传 ${extractedFiles.length} 个文件数据 (支持断点续传与智能重试)...`);
       const treeItems: { path: string; mode: string; type: string; sha: string }[] = [];
 
+      let cachedHits = 0;
       for (let i = 0; i < extractedFiles.length; i++) {
         const file = extractedFiles[i];
-        const base64Content = uint8ToBase64(file.content);
+        const normalizedPath = file.path
+          .replace(/\\/g, '/')
+          .replace(/^\.\//, '')
+          .replace(/^\/+/, '');
 
-        const blobUrl = `https://api.github.com/repos/${username}/${repo}/git/blobs`;
-        let blobRes = await fetch(blobUrl, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
-            content: base64Content,
-            encoding: 'base64'
-          })
-        });
+        const cacheKey = `${normalizedPath}_${file.size}`;
+        let blobSha = blobShaCacheRef.current.get(cacheKey);
 
-        // Fail-safe handling if Git repository is empty
-        if (!blobRes.ok) {
-          const errData = await blobRes.json().catch(() => ({}));
-          if (errData.message && errData.message.includes('Git Repository is empty')) {
-            addLog(`检测到 Git 数据库仍处于未初始化状态，再次初始化基础节点...`, 'info');
-            const initUrl = `https://api.github.com/repos/${username}/${repo}/contents/.gitkeep`;
-            await fetch(initUrl, {
-              method: 'PUT',
-              headers,
-              body: JSON.stringify({
-                message: commitMessage || 'initial commit',
-                content: btoa('# Initialized by ZipDeploy'),
-                branch: branch
-              })
-            });
-
-            // Retry blob upload
-            blobRes = await fetch(blobUrl, {
-              method: 'POST',
-              headers,
-              body: JSON.stringify({
-                content: base64Content,
-                encoding: 'base64'
-              })
-            });
+        if (blobSha) {
+          cachedHits++;
+          treeItems.push({
+            path: normalizedPath,
+            mode: '100644',
+            type: 'blob',
+            sha: blobSha
+          });
+        } else {
+          // Small pacing delay to prevent triggering GitHub secondary rate limits
+          if (i > 0) {
+            await new Promise(r => setTimeout(r, 45));
           }
-        }
 
-        if (!blobRes.ok) {
-          const errData = await blobRes.json().catch(() => ({}));
-          throw new Error(`文件 [${file.path}] Blob 上传失败: ${formatApiError(errData, blobRes.statusText)}`);
-        }
+          const base64Content = uint8ToBase64(file.content);
+          const blobUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/blobs`;
+          
+          const blobRes = await robustFetch(blobUrl, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              content: base64Content,
+              encoding: 'base64'
+            })
+          }, 4, 30000);
 
-        const blobData = await blobRes.json();
-        treeItems.push({
-          path: file.path,
-          mode: '100644',
-          type: 'blob',
-          sha: blobData.sha
-        });
+          if (!blobRes.ok) {
+            const errData = await blobRes.json().catch(() => ({}));
+            throw new Error(`文件 [${normalizedPath}] 上传失败 (${blobRes.status}): ${formatApiError(errData, blobRes.statusText)}`);
+          }
+
+          const blobData = await blobRes.json();
+          blobSha = blobData.sha;
+          blobShaCacheRef.current.set(cacheKey, blobSha);
+
+          treeItems.push({
+            path: normalizedPath,
+            mode: '100644',
+            type: 'blob',
+            sha: blobSha
+          });
+        }
 
         const progressPercent = Math.floor(15 + ((i + 1) / extractedFiles.length) * 60);
         setUploadProgress(progressPercent);
-        setCurrentStepText(`已处理 (${i + 1}/${extractedFiles.length}): ${file.path}`);
+        setCurrentStepText(`上传进度 (${i + 1}/${extractedFiles.length}): ${normalizedPath}`);
       }
 
-      addLog(`已完成全部 ${extractedFiles.length} 个文件的 Git Blob 构建`, 'success');
+      if (cachedHits > 0) {
+        addLog(`已完成全部 ${extractedFiles.length} 个文件构建 (⚡ 成功复用 ${cachedHits} 个断点缓存文件)`, 'success');
+      } else {
+        addLog(`已完成全部 ${extractedFiles.length} 个文件的 Git Blob 构建`, 'success');
+      }
       setUploadProgress(80);
 
       // 3. Create Git Tree
       setCurrentStepText('正在生成 Git Tree 目录对象...');
-      const treeUrl = `https://api.github.com/repos/${username}/${repo}/git/trees`;
+      const treeUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/trees`;
       
       const treeBody: any = { tree: treeItems };
       if (!forcePush && parentCommitSha) {
         treeBody.base_tree = parentCommitSha;
       }
 
-      const treeRes = await fetch(treeUrl, {
+      const treeRes = await robustFetch(treeUrl, {
         method: 'POST',
         headers,
         body: JSON.stringify(treeBody)
-      });
+      }, 3);
 
       if (!treeRes.ok) {
         const errData = await treeRes.json().catch(() => ({}));
@@ -550,12 +673,12 @@ jobs:
 
       // 4. Create Commit
       setCurrentStepText('正在生成 Commit 提交对象...');
-      const commitUrl = `https://api.github.com/repos/${username}/${repo}/git/commits`;
+      const commitUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/commits`;
       
       const cleanEmail = (email && email.trim().includes('@'))
         ? email.trim()
-        : `${username.trim() || 'user'}@users.noreply.github.com`;
-      const cleanName = username.trim() || 'ZipDeploy User';
+        : `${cleanUsername}@users.noreply.github.com`;
+      const cleanName = cleanUsername || 'ZipDeploy User';
 
       const commitBody: any = {
         message: commitMessage.trim() || 'refactor: auto deploy unzipped contents',
@@ -568,33 +691,30 @@ jobs:
         }
       };
 
-      let commitRes = await fetch(commitUrl, {
+      let commitRes = await robustFetch(commitUrl, {
         method: 'POST',
         headers,
         body: JSON.stringify(commitBody)
-      });
+      }, 3);
 
       // Fail-safe auto-retry if 422 Validation Failed occurs
       if (!commitRes.ok && commitRes.status === 422) {
-        addLog('⚠️ 第一次创建 Commit 触发 422 校验机制，正在自动重试 (省略自定义 Author 属性)...', 'info');
-        
-        // Retry Attempt 1: Omit custom author object (let GitHub API use token user's defaults)
+        addLog('⚠️ 提交触发 GitHub 422 校验，正在自动重试 (省略自定义 Author)...', 'info');
         delete commitBody.author;
-        commitRes = await fetch(commitUrl, {
+        commitRes = await robustFetch(commitUrl, {
           method: 'POST',
           headers,
           body: JSON.stringify(commitBody)
-        });
+        }, 2);
 
-        // Retry Attempt 2: If still failing and parents is non-empty, try root commit (empty parents)
         if (!commitRes.ok && commitRes.status === 422 && commitBody.parents && commitBody.parents.length > 0) {
-          addLog('⚠️ 仍处于 422 校验异常，尝试切换为独立 Root Commit 节点重试...', 'info');
+          addLog('⚠️ 尝试切换为独立 Root Commit 节点重试...', 'info');
           commitBody.parents = [];
-          commitRes = await fetch(commitUrl, {
+          commitRes = await robustFetch(commitUrl, {
             method: 'POST',
             headers,
             body: JSON.stringify(commitBody)
-          });
+          }, 2);
         }
       }
 
@@ -608,35 +728,35 @@ jobs:
       setUploadProgress(95);
 
       // 5. Update Branch Ref
-      setCurrentStepText(`正在将 ${branch} 分支更新指向至新提交...`);
-      const updateRefUrl = `https://api.github.com/repos/${username}/${repo}/git/refs/heads/${branch}`;
-      const updateRefRes = await fetch(updateRefUrl, {
+      setCurrentStepText(`正在将 ${cleanBranch} 分支更新指向至新提交...`);
+      const updateRefUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/refs/heads/${cleanBranch}`;
+      const updateRefRes = await robustFetch(updateRefUrl, {
         method: 'PATCH',
         headers,
         body: JSON.stringify({
           sha: commitData.sha,
           force: forcePush
         })
-      });
+      }, 3);
 
       if (!updateRefRes.ok) {
         if (updateRefRes.status === 404 || updateRefRes.status === 409 || updateRefRes.status === 422) {
-          const createRefUrl = `https://api.github.com/repos/${username}/${repo}/git/refs`;
-          const createRefRes = await fetch(createRefUrl, {
+          const createRefUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/refs`;
+          const createRefRes = await robustFetch(createRefUrl, {
             method: 'POST',
             headers,
             body: JSON.stringify({
-              ref: `refs/heads/${branch}`,
+              ref: `refs/heads/${cleanBranch}`,
               sha: commitData.sha
             })
-          });
+          }, 3);
           if (!createRefRes.ok) {
             const errData = await createRefRes.json().catch(() => ({}));
-            throw new Error(`创建新分支 ${branch} 失败: ${formatApiError(errData, createRefRes.statusText)}`);
+            throw new Error(`创建新分支 ${cleanBranch} 失败: ${formatApiError(errData, createRefRes.statusText)}`);
           }
         } else {
           const errData = await updateRefRes.json().catch(() => ({}));
-          throw new Error(`更新分支 ${branch} 引用失败: ${formatApiError(errData, updateRefRes.statusText)}`);
+          throw new Error(`更新分支 ${cleanBranch} 引用失败: ${formatApiError(errData, updateRefRes.statusText)}`);
         }
       }
 
@@ -651,8 +771,18 @@ jobs:
     } catch (err: any) {
       console.error(err);
       setIsUploading(false);
-      setUploadError(err.message || '网络连接中断或 API 授权失效');
-      addLog(`❌ 部署中断: ${err.message}`, 'error');
+      
+      let errorMsg = err.message || '网络连接中断或 API 授权失效';
+      if (errorMsg.includes('401') || errorMsg.toLowerCase().includes('bad credentials')) {
+        errorMsg = 'GitHub Token 无效或已过期，请检查 Token 并确保拥有 repo 读写权限';
+      } else if (errorMsg.includes('404')) {
+        errorMsg = '找不到目标仓库，请检查用户名/仓库名拼写是否正确，或 Token 是否有访问该私有仓库的权限';
+      } else if (errorMsg.includes('403')) {
+        errorMsg = 'Token 权限不足或触发 GitHub 频率限制，请确认创建 Token 时勾选了 repo 权限';
+      }
+
+      setUploadError(errorMsg);
+      addLog(`❌ 部署中断: ${errorMsg}`, 'error');
     }
   };
 
@@ -1306,11 +1436,33 @@ echo "https://\${USERNAME}.github.io/\${REPO}/"`;
                   </div>
                 )}
 
-                {/* Error Banner */}
+                {/* Error Banner with Resumable Retry */}
                 {uploadError && (
-                  <div className="bg-rose-50 border border-rose-200 text-rose-900 p-4 rounded-2xl flex items-center gap-2 text-xs font-semibold">
-                    <XCircle className="w-4 h-4 text-rose-600 shrink-0" />
-                    <span>{uploadError}</span>
+                  <div className="bg-rose-50 border border-rose-200 text-rose-950 p-4.5 rounded-2xl space-y-3 text-xs">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex items-start gap-2.5">
+                        <XCircle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+                        <div>
+                          <p className="font-bold text-rose-900 text-sm">上传过程中断</p>
+                          <p className="text-rose-800 mt-0.5 leading-relaxed">{uploadError}</p>
+                        </div>
+                      </div>
+                      <button
+                        onClick={handleUploadToGithub}
+                        disabled={isUploading}
+                        className="inline-flex items-center gap-1.5 bg-rose-900 hover:bg-rose-950 text-white font-bold px-4 py-2 rounded-xl transition shadow-sm shrink-0"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                        <span>断点继续上传</span>
+                      </button>
+                    </div>
+
+                    <div className="bg-white/80 border border-rose-200/80 rounded-xl p-3 text-[11px] text-rose-900 space-y-1">
+                      <div className="font-semibold text-rose-950">💡 排查与断点续传说明：</div>
+                      <p>1. <strong>无需重新开始：</strong> 已成功上传的文件已被内存缓存记录，点击「断点继续上传」会<strong>自动跳过已上传文件</strong>，直接从失败处继续！</p>
+                      <p>2. <strong>手机网络波动：</strong> 移动端容易短暂丢包，多次重试会自动接续完成。</p>
+                      <p>3. <strong>权限检查：</strong> 请确认 GitHub Token 拥有 <code>repo</code> 或 <code>workflow</code> 权限，且仓库名无误。</p>
+                    </div>
                   </div>
                 )}
 
