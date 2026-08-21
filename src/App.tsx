@@ -132,6 +132,8 @@ export default function App() {
   const [isUnzipping, setIsUnzipping] = useState<boolean>(false);
   const [unzipError, setUnzipError] = useState<string | null>(null);
   const [fileSearch, setFileSearch] = useState<string>('');
+  const [ignoreNodeModules, setIgnoreNodeModules] = useState<boolean>(true);
+  const [filterStats, setFilterStats] = useState<{ junkCount: number; nodeModulesCount: number }>({ junkCount: 0, nodeModulesCount: 0 });
 
   // Upload Progress States
   const [isUploading, setIsUploading] = useState<boolean>(false);
@@ -140,6 +142,19 @@ export default function App() {
   const [logs, setLogs] = useState<UploadLog[]>([]);
   const [uploadSuccess, setUploadSuccess] = useState<boolean>(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+
+  // Prevent accidental page navigation or closing during upload
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (isUploading) {
+        e.preventDefault();
+        e.returnValue = '文件部署上传中，离开或刷新页面可能会中断当前传输！';
+        return e.returnValue;
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [isUploading]);
 
   // Navigation & UI States
   const [activeTab, setActiveTab] = useState<'browser-upload' | 'termux-script' | 'github-action' | 'faq'>('browser-upload');
@@ -206,7 +221,7 @@ export default function App() {
     }
   };
 
-  const processZipFile = async (file: File) => {
+  const processZipFile = async (file: File, skipNodeModules = ignoreNodeModules) => {
     setZipFile(file);
     setIsUnzipping(true);
     setUnzipError(null);
@@ -235,11 +250,14 @@ export default function App() {
         }
       }
 
+      let junkCount = 0;
+      let nodeModulesCount = 0;
+
       for (const relativePath of Object.keys(zipContent.files)) {
         const zipEntry = zipContent.files[relativePath];
         if (zipEntry.dir) continue;
 
-        // Ignore macOS, Windows, and Git metadata junk files
+        // Ignore macOS, Windows, Git metadata junk files
         const filename = relativePath.split('/').pop() || '';
         if (
           relativePath.includes('__MACOSX/') ||
@@ -250,7 +268,16 @@ export default function App() {
           relativePath.startsWith('.git/') ||
           relativePath.includes('/.git/')
         ) {
+          junkCount++;
           continue;
+        }
+
+        // Conditionally filter node_modules
+        if (relativePath.startsWith('node_modules/') || relativePath.includes('/node_modules/')) {
+          nodeModulesCount++;
+          if (skipNodeModules) {
+            continue;
+          }
         }
 
         let cleanPath = relativePath;
@@ -354,12 +381,20 @@ jobs:
         }
       }
 
+      setFilterStats({ junkCount, nodeModulesCount });
       setExtractedFiles(fileList);
       setIsUnzipping(false);
     } catch (err: any) {
       console.error(err);
       setIsUnzipping(false);
       setUnzipError(`压缩包解析失败: ${err.message || '文件损坏或非标准 ZIP 格式'}`);
+    }
+  };
+
+  const handleToggleNodeModules = (skip: boolean) => {
+    setIgnoreNodeModules(skip);
+    if (zipFile) {
+      processZipFile(zipFile, skip);
     }
   };
 
@@ -772,13 +807,18 @@ jobs:
       console.error(err);
       setIsUploading(false);
       
-      let errorMsg = err.message || '网络连接中断或 API 授权失效';
-      if (errorMsg.includes('401') || errorMsg.toLowerCase().includes('bad credentials')) {
+      let rawError = err.message || '网络连接中断或 API 授权失效';
+      let errorMsg = rawError;
+
+      const lowerErr = rawError.toLowerCase();
+      if (lowerErr.includes('protected branch') || lowerErr.includes('branch is protected') || lowerErr.includes('push is restricted')) {
+        errorMsg = `目标分支 [${cleanBranch}] 触发了 GitHub 分支保护规则 (Branch Protection Rule)。解决方法：去 GitHub 仓库 Settings -> Branches 暂时解除分支保护，或更换分支名 (如 gh-pages) 重试。`;
+      } else if (lowerErr.includes('resource not accessible by integration') || lowerErr.includes('403')) {
+        errorMsg = 'Token 权限不足。如使用 GitHub 新版细粒度 Token (Fine-grained PAT)，请去 Settings -> Developer settings -> Fine-grained tokens 确保在 Repository permissions 中勾选了「Contents: Read & write」。';
+      } else if (lowerErr.includes('401') || lowerErr.includes('bad credentials')) {
         errorMsg = 'GitHub Token 无效或已过期，请检查 Token 并确保拥有 repo 读写权限';
-      } else if (errorMsg.includes('404')) {
+      } else if (lowerErr.includes('404')) {
         errorMsg = '找不到目标仓库，请检查用户名/仓库名拼写是否正确，或 Token 是否有访问该私有仓库的权限';
-      } else if (errorMsg.includes('403')) {
-        errorMsg = 'Token 权限不足或触发 GitHub 频率限制，请确认创建 Token 时勾选了 repo 权限';
       }
 
       setUploadError(errorMsg);
@@ -1314,6 +1354,39 @@ echo "https://\${USERNAME}.github.io/\${REPO}/"`;
                     {isUploading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
                     {isUploading ? '正在同步至 GitHub...' : '确认解压并直接覆盖推送到 GitHub'}
                   </button>
+                </div>
+
+                {/* Filter Status & Options Banner */}
+                <div className="bg-neutral-50 border border-neutral-200/80 rounded-2xl p-4 text-xs space-y-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-neutral-800 font-medium">
+                      <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+                      <span>
+                        全量保留你的代码文件与隐藏配置 (<code>.gitignore</code>, <code>.env</code>, <code>.github</code> 等)
+                      </span>
+                    </div>
+
+                    {filterStats.nodeModulesCount > 0 && (
+                      <label className="inline-flex items-center gap-2 cursor-pointer bg-white px-3 py-1.5 rounded-xl border border-neutral-200 text-neutral-800 font-semibold hover:border-black transition">
+                        <input
+                          type="checkbox"
+                          checked={ignoreNodeModules}
+                          onChange={(e) => handleToggleNodeModules(e.target.checked)}
+                          className="rounded text-black focus:ring-black accent-black w-3.5 h-3.5"
+                        />
+                        <span>跳过 node_modules 依赖库 ({filterStats.nodeModulesCount} 个文件)</span>
+                      </label>
+                    )}
+                  </div>
+
+                  {(filterStats.junkCount > 0 || filterStats.nodeModulesCount > 0) && (
+                    <p className="text-[11px] text-neutral-500">
+                      💡 提示：
+                      {filterStats.junkCount > 0 && `已净化屏蔽 ${filterStats.junkCount} 个系统垃圾/元数据文件 (.DS_Store / __MACOSX / .git)`}
+                      {filterStats.junkCount > 0 && filterStats.nodeModulesCount > 0 && ignoreNodeModules && ' ； '}
+                      {filterStats.nodeModulesCount > 0 && ignoreNodeModules && `已跳过 ${filterStats.nodeModulesCount} 个 node_modules 依赖文件（取消勾选右侧开关可取消跳过）。`}
+                    </p>
+                  )}
                 </div>
 
                 {/* Progress Bar */}
