@@ -32,7 +32,14 @@ import {
   Play,
   Save,
   ShieldCheck,
-  CheckCircle
+  CheckCircle,
+  AlertTriangle,
+  LifeBuoy,
+  ShieldAlert,
+  Wrench,
+  BookOpen,
+  Info,
+  Lock
 } from 'lucide-react';
 
 interface ExtractedFile {
@@ -47,6 +54,135 @@ interface UploadLog {
   time: string;
   message: string;
   status: 'pending' | 'success' | 'error' | 'info';
+}
+
+interface SolutionStep {
+  text: string;
+  linkText?: string;
+  linkUrl?: string;
+}
+
+interface ErrorDiagnostics {
+  code: string;
+  title: string;
+  reason: string;
+  steps: SolutionStep[];
+  retryHint?: string;
+}
+
+function analyzeError(rawError: string, username: string, repo: string, branch: string): ErrorDiagnostics {
+  const lower = rawError.toLowerCase();
+
+  // 1. Invalid Blob / Cache Expired
+  if (lower.includes('is not a valid blob') || lower.includes('invalid blob')) {
+    return {
+      code: 'ERR_CACHE_BLOB_EXPIRED',
+      title: '缓存文件索引失效',
+      reason: '由于网络中断或断点记录过期，GitHub 端的缓存索引失效。已为您自动清空过期缓存。',
+      steps: [
+        { text: '点击下方「断点继续上传」按钮，系统会自动跳过已验证块，全量重发无效缓存文件。' },
+        { text: '传输过程中请尽量保持页面在前台，避免手机息屏挂起网络。' }
+      ],
+      retryHint: '直接点击下方「断点继续上传」即可自动清除并恢复部署。'
+    };
+  }
+
+  // 2. Protected Branch
+  if (lower.includes('protected branch') || lower.includes('branch is protected') || lower.includes('push is restricted')) {
+    return {
+      code: 'ERR_BRANCH_PROTECTION',
+      title: `分支 [${branch || 'main'}] 启用了分支保护规则 (Protected Branch)`,
+      reason: 'GitHub 仓库默认启用了分支保护规则（例如禁止 Force Push 或强制要求 Pull Request），导致强制全量提交被拒绝。',
+      steps: [
+        { 
+          text: '解法 ①（推荐）：前往 GitHub 仓库设置暂时关闭保护规则', 
+          linkText: `管理 ${username || 'repo'}/${repo || 'name'} 的 Branches 设置`, 
+          linkUrl: `https://github.com/${username}/${repo}/settings/branches` 
+        },
+        { text: '在 Branch protection rules 中找到对应的规则，点击 Edit 按钮，暂时取消勾选规则，或勾选「Allow force pushes」。' },
+        { text: '解法 ②：将顶部的「目标分支名」修改为 gh-pages 后重新提交，部署到一个独立的分支。' }
+      ]
+    };
+  }
+
+  // 3. Fine-grained PAT / Token permissions 403
+  if (lower.includes('resource not accessible by integration') || (lower.includes('403') && !lower.includes('rate limit'))) {
+    return {
+      code: 'ERR_TOKEN_403_PERMISSION',
+      title: 'GitHub Access Token 权限不足 (403 Forbidden)',
+      reason: '使用的 GitHub Access Token 缺少对仓库代码写入的权限，或者使用了新版 Fine-grained Token 但未勾选 Contents 读写支持。',
+      steps: [
+        { 
+          text: '若使用 Fine-grained Token (细粒度 Token)，请去 GitHub 个人 Token 管理设置', 
+          linkText: '查看 Fine-grained Tokens', 
+          linkUrl: 'https://github.com/settings/tokens?type=beta' 
+        },
+        { text: '编辑该 Token，在 Repository permissions 中将「Contents」选项改为 Read and write (读与写)。' },
+        { 
+          text: '若使用 Classic Token (经典 Token)，请前往经典 Token 列表', 
+          linkText: '查看 Classic Tokens', 
+          linkUrl: 'https://github.com/settings/tokens' 
+        },
+        { text: '确保勾选了最顶部的 「repo」(完整仓库控制权限)。' }
+      ]
+    };
+  }
+
+  // 4. Bad Credentials / 401
+  if (lower.includes('401') || lower.includes('bad credentials')) {
+    return {
+      code: 'ERR_TOKEN_401_INVALID',
+      title: 'GitHub Access Token 无效或已过期 (401 Unauthorized)',
+      reason: '填写的 Token 复制错误、遗漏了前缀 `ghp_`，或者该 Token 已被撤销或到了设定的过期时间。',
+      steps: [
+        { text: '请检查顶部「GitHub Personal Access Token」文本框，确保复制粘贴完整无多余空格。' },
+        { 
+          text: '若 Token 已失效，点击右侧链接重新生成全新 Token', 
+          linkText: '生成包含 repo 权限的新 Token', 
+          linkUrl: 'https://github.com/settings/tokens/new?scopes=repo&description=deploy-tool' 
+        }
+      ]
+    };
+  }
+
+  // 5. 404 Repo Not Found
+  if (lower.includes('404')) {
+    return {
+      code: 'ERR_REPO_404_NOT_FOUND',
+      title: '未找到目标仓库 (404 Not Found)',
+      reason: `无法找到目标仓库 [${username}/${repo}]。可能原因：1. 用户名或仓库名拼写大小写有误；2. 这是私有仓库 (Private Repo)，但 Token 没勾选 repo 读写权限。`,
+      steps: [
+        { text: `核对目标用户名是否为 [${username}]，仓库名是否为 [${repo}]（严禁多填斜杠或空格）。` },
+        { text: '在浏览器中测试仓库链接是否可访问：', linkText: `打开 https://github.com/${username}/${repo}`, linkUrl: `https://github.com/${username}/${repo}` },
+        { text: '若确认是私有仓库，请重新生成勾选了 repo 权限的 Token 后在网页重试。' }
+      ]
+    };
+  }
+
+  // 6. Rate Limit / 429
+  if (lower.includes('rate limit') || lower.includes('secondary rate') || lower.includes('429')) {
+    return {
+      code: 'ERR_API_RATE_LIMIT',
+      title: '触发 GitHub API 频次风控 (API Rate Limit)',
+      reason: '短时间内发送了较多 API 请求，触发了 GitHub 的防刷保护机制。',
+      steps: [
+        { text: '不用担心，本系统内置了自动平滑退避机制。' },
+        { text: '请静置等待 30 秒至 1 分钟，然后直接点击下方「断点继续上传」即可接续完成。' }
+      ]
+    };
+  }
+
+  // Default fallback
+  return {
+    code: 'ERR_UNKNOWN_DEPLOY',
+    title: '网络传输中断或提交异常',
+    reason: rawError,
+    steps: [
+      { text: '1. 检查网络连接，避免移动端锁屏或切换 App 导致网络挂起。' },
+      { text: '2. 检查 GitHub Token 读写权限与仓库名拼写是否完全匹配。' },
+      { text: '3. 点击下方「断点继续上传」按钮重试，系统会从上一次中断处秒级恢复。' }
+    ]
+  };
 }
 
 export default function App() {
@@ -132,6 +268,7 @@ export default function App() {
   const [isUnzipping, setIsUnzipping] = useState<boolean>(false);
   const [unzipError, setUnzipError] = useState<string | null>(null);
   const [fileSearch, setFileSearch] = useState<string>('');
+  const [visibleFileCount, setVisibleFileCount] = useState<number>(100);
   const [ignoreNodeModules, setIgnoreNodeModules] = useState<boolean>(true);
   const [filterStats, setFilterStats] = useState<{ junkCount: number; nodeModulesCount: number }>({ junkCount: 0, nodeModulesCount: 0 });
 
@@ -142,6 +279,7 @@ export default function App() {
   const [logs, setLogs] = useState<UploadLog[]>([]);
   const [uploadSuccess, setUploadSuccess] = useState<boolean>(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [errorDiagnostics, setErrorDiagnostics] = useState<ErrorDiagnostics | null>(null);
 
   // Prevent accidental page navigation or closing during upload
   useEffect(() => {
@@ -206,18 +344,32 @@ export default function App() {
 
   // Handle ZIP selection & extraction
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    await processZipFile(file);
+    try {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      await processZipFile(file);
+    } catch (err: any) {
+      console.error(err);
+      setUnzipError(`文件处理异常: ${err.message || '系统发生未知错误'}`);
+    } finally {
+      if (e.target) {
+        e.target.value = '';
+      }
+    }
   };
 
   const handleDrop = async (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
-    const file = e.dataTransfer.files?.[0];
-    if (file && (file.name.endsWith('.zip') || file.type.includes('zip'))) {
-      await processZipFile(file);
-    } else {
-      setUnzipError('请上传标准的 .zip 格式压缩包');
+    try {
+      const file = e.dataTransfer.files?.[0];
+      if (file && (file.name.endsWith('.zip') || file.type.includes('zip'))) {
+        await processZipFile(file);
+      } else {
+        setUnzipError('请上传标准的 .zip 格式压缩包');
+      }
+    } catch (err: any) {
+      console.error(err);
+      setUnzipError(`文件拖拽解析异常: ${err.message || '格式不受支持'}`);
     }
   };
 
@@ -228,6 +380,7 @@ export default function App() {
     setUploadSuccess(false);
     setUploadError(null);
     setLogs([]);
+    setVisibleFileCount(100);
 
     try {
       const zip = new JSZip();
@@ -287,14 +440,17 @@ export default function App() {
 
         if (!cleanPath) continue;
 
-        const contentUint8 = await zipEntry.async('uint8array');
-
-        fileList.push({
-          path: cleanPath,
-          size: contentUint8.byteLength,
-          isDir: false,
-          content: contentUint8
-        });
+        try {
+          const contentUint8 = await zipEntry.async('uint8array');
+          fileList.push({
+            path: cleanPath,
+            size: contentUint8.byteLength,
+            isDir: false,
+            content: contentUint8
+          });
+        } catch (entryErr) {
+          console.warn(`跳过无法解压读取的文件 [${cleanPath}]:`, entryErr);
+        }
       }
 
       // Auto inject GitHub Pages build & deploy workflow for React/Vite source projects
@@ -402,7 +558,7 @@ jobs:
   const uint8ToBase64 = (uint8: Uint8Array): string => {
     let binary = '';
     const len = uint8.length;
-    const chunkSize = 0x8000; // 32768 chunk size for high performance
+    const chunkSize = 1024; // 1024 is completely safe for arguments stack on mobile browsers and webviews
     for (let i = 0; i < len; i += chunkSize) {
       const chunk = uint8.subarray(i, Math.min(i + chunkSize, len));
       binary += String.fromCharCode.apply(null, chunk as any);
@@ -520,6 +676,7 @@ jobs:
     setIsUploading(true);
     setUploadSuccess(false);
     setUploadError(null);
+    setErrorDiagnostics(null);
     setUploadProgress(5);
 
     const headers = {
@@ -614,92 +771,119 @@ jobs:
 
       // 2. Upload Blobs with Resumable Caching & Anti-Throttling Pacing
       setCurrentStepText(`正在依次构建并上传 ${extractedFiles.length} 个文件数据 (支持断点续传与智能重试)...`);
-      const treeItems: { path: string; mode: string; type: string; sha: string }[] = [];
+      
+      const uploadAllBlobs = async (useCache = true) => {
+        const items: { path: string; mode: string; type: string; sha: string }[] = [];
+        let hits = 0;
 
-      let cachedHits = 0;
-      for (let i = 0; i < extractedFiles.length; i++) {
-        const file = extractedFiles[i];
-        const normalizedPath = file.path
-          .replace(/\\/g, '/')
-          .replace(/^\.\//, '')
-          .replace(/^\/+/, '');
+        for (let i = 0; i < extractedFiles.length; i++) {
+          const file = extractedFiles[i];
+          const normalizedPath = file.path
+            .replace(/\\/g, '/')
+            .replace(/^\.\//, '')
+            .replace(/^\/+/, '');
 
-        const cacheKey = `${normalizedPath}_${file.size}`;
-        let blobSha = blobShaCacheRef.current.get(cacheKey);
+          const cacheKey = `${cleanUsername}/${cleanRepo}:${normalizedPath}_${file.size}`;
+          let blobSha = useCache ? blobShaCacheRef.current.get(cacheKey) : undefined;
 
-        if (blobSha) {
-          cachedHits++;
-          treeItems.push({
-            path: normalizedPath,
-            mode: '100644',
-            type: 'blob',
-            sha: blobSha
-          });
-        } else {
-          // Small pacing delay to prevent triggering GitHub secondary rate limits
-          if (i > 0) {
-            await new Promise(r => setTimeout(r, 45));
+          if (blobSha) {
+            hits++;
+            items.push({
+              path: normalizedPath,
+              mode: '100644',
+              type: 'blob',
+              sha: blobSha
+            });
+          } else {
+            // Small pacing delay to prevent triggering GitHub secondary rate limits
+            if (i > 0) {
+              await new Promise(r => setTimeout(r, 45));
+            }
+
+            const base64Content = uint8ToBase64(file.content);
+            const blobUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/blobs`;
+            
+            const blobRes = await robustFetch(blobUrl, {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({
+                content: base64Content,
+                encoding: 'base64'
+              })
+            }, 4, 30000);
+
+            if (!blobRes.ok) {
+              const errData = await blobRes.json().catch(() => ({}));
+              throw new Error(`文件 [${normalizedPath}] 上传失败 (${blobRes.status}): ${formatApiError(errData, blobRes.statusText)}`);
+            }
+
+            const blobData = await blobRes.json();
+            blobSha = blobData.sha;
+            blobShaCacheRef.current.set(cacheKey, blobSha);
+
+            items.push({
+              path: normalizedPath,
+              mode: '100644',
+              type: 'blob',
+              sha: blobSha
+            });
           }
 
-          const base64Content = uint8ToBase64(file.content);
-          const blobUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/blobs`;
-          
-          const blobRes = await robustFetch(blobUrl, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-              content: base64Content,
-              encoding: 'base64'
-            })
-          }, 4, 30000);
-
-          if (!blobRes.ok) {
-            const errData = await blobRes.json().catch(() => ({}));
-            throw new Error(`文件 [${normalizedPath}] 上传失败 (${blobRes.status}): ${formatApiError(errData, blobRes.statusText)}`);
-          }
-
-          const blobData = await blobRes.json();
-          blobSha = blobData.sha;
-          blobShaCacheRef.current.set(cacheKey, blobSha);
-
-          treeItems.push({
-            path: normalizedPath,
-            mode: '100644',
-            type: 'blob',
-            sha: blobSha
-          });
+          const progressPercent = Math.floor(15 + ((i + 1) / extractedFiles.length) * 60);
+          setUploadProgress(progressPercent);
+          setCurrentStepText(`上传进度 (${i + 1}/${extractedFiles.length}): ${normalizedPath}`);
         }
 
-        const progressPercent = Math.floor(15 + ((i + 1) / extractedFiles.length) * 60);
-        setUploadProgress(progressPercent);
-        setCurrentStepText(`上传进度 (${i + 1}/${extractedFiles.length}): ${normalizedPath}`);
-      }
+        if (hits > 0) {
+          addLog(`已完成全部 ${extractedFiles.length} 个文件构建 (⚡ 成功复用 ${hits} 个断点缓存文件)`, 'success');
+        } else {
+          addLog(`已完成全部 ${extractedFiles.length} 个文件的 Git Blob 构建`, 'success');
+        }
+        return items;
+      };
 
-      if (cachedHits > 0) {
-        addLog(`已完成全部 ${extractedFiles.length} 个文件构建 (⚡ 成功复用 ${cachedHits} 个断点缓存文件)`, 'success');
-      } else {
-        addLog(`已完成全部 ${extractedFiles.length} 个文件的 Git Blob 构建`, 'success');
-      }
+      let treeItems = await uploadAllBlobs(true);
       setUploadProgress(80);
 
       // 3. Create Git Tree
       setCurrentStepText('正在生成 Git Tree 目录对象...');
       const treeUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/trees`;
       
-      const treeBody: any = { tree: treeItems };
+      let treeBody: any = { tree: treeItems };
       if (!forcePush && parentCommitSha) {
         treeBody.base_tree = parentCommitSha;
       }
 
-      const treeRes = await robustFetch(treeUrl, {
+      let treeRes = await robustFetch(treeUrl, {
         method: 'POST',
         headers,
         body: JSON.stringify(treeBody)
       }, 3);
 
+      // Self-healing: If GitHub returns 'is not a valid blob', wipe invalid cache and retry freshly once
       if (!treeRes.ok) {
         const errData = await treeRes.json().catch(() => ({}));
-        throw new Error(`创建 Git Tree 目录节点失败: ${formatApiError(errData, treeRes.statusText)}`);
+        const errDetail = formatApiError(errData, treeRes.statusText);
+
+        if (errDetail.includes('is not a valid blob') || errDetail.includes('invalid blob')) {
+          addLog(`⚠️ 检测到部分缓存 Blob 节点在目标仓库中失效，正在自动清除无效缓存并全量重新传输...`, 'info');
+          blobShaCacheRef.current.clear();
+          
+          // Re-upload all blobs with forced cache bypass
+          treeItems = await uploadAllBlobs(false);
+          treeBody.tree = treeItems;
+
+          treeRes = await robustFetch(treeUrl, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(treeBody)
+          }, 3);
+        }
+
+        if (!treeRes.ok) {
+          const finalErrData = await treeRes.json().catch(() => ({}));
+          throw new Error(`创建 Git Tree 目录节点失败: ${formatApiError(finalErrData, treeRes.statusText)}`);
+        }
       }
 
       const treeData = await treeRes.json();
@@ -808,21 +992,15 @@ jobs:
       setIsUploading(false);
       
       let rawError = err.message || '网络连接中断或 API 授权失效';
-      let errorMsg = rawError;
+      const diag = analyzeError(rawError, cleanUsername, cleanRepo, cleanBranch);
 
-      const lowerErr = rawError.toLowerCase();
-      if (lowerErr.includes('protected branch') || lowerErr.includes('branch is protected') || lowerErr.includes('push is restricted')) {
-        errorMsg = `目标分支 [${cleanBranch}] 触发了 GitHub 分支保护规则 (Branch Protection Rule)。解决方法：去 GitHub 仓库 Settings -> Branches 暂时解除分支保护，或更换分支名 (如 gh-pages) 重试。`;
-      } else if (lowerErr.includes('resource not accessible by integration') || lowerErr.includes('403')) {
-        errorMsg = 'Token 权限不足。如使用 GitHub 新版细粒度 Token (Fine-grained PAT)，请去 Settings -> Developer settings -> Fine-grained tokens 确保在 Repository permissions 中勾选了「Contents: Read & write」。';
-      } else if (lowerErr.includes('401') || lowerErr.includes('bad credentials')) {
-        errorMsg = 'GitHub Token 无效或已过期，请检查 Token 并确保拥有 repo 读写权限';
-      } else if (lowerErr.includes('404')) {
-        errorMsg = '找不到目标仓库，请检查用户名/仓库名拼写是否正确，或 Token 是否有访问该私有仓库的权限';
+      if (diag.code === 'ERR_CACHE_BLOB_EXPIRED') {
+        blobShaCacheRef.current.clear();
       }
 
-      setUploadError(errorMsg);
-      addLog(`❌ 部署中断: ${errorMsg}`, 'error');
+      setErrorDiagnostics(diag);
+      setUploadError(diag.reason);
+      addLog(`❌ 部署中断 [${diag.code}]: ${diag.title} - ${diag.reason}`, 'error');
     }
   };
 
@@ -1261,7 +1439,7 @@ echo "https://\${USERNAME}.github.io/\${REPO}/"`;
                 : 'border-transparent text-neutral-500 hover:text-neutral-800'
             }`}
           >
-            <HelpCircle className="w-4 h-4 text-neutral-800" /> 4. 常见问题 FAQ
+            <ShieldAlert className="w-4 h-4 text-rose-600" /> 4. 报错与故障排查手册
           </button>
         </div>
 
@@ -1509,32 +1687,72 @@ echo "https://\${USERNAME}.github.io/\${REPO}/"`;
                   </div>
                 )}
 
-                {/* Error Banner with Resumable Retry */}
+                {/* Error Banner with Resumable Retry & Diagnostics */}
                 {uploadError && (
-                  <div className="bg-rose-50 border border-rose-200 text-rose-950 p-4.5 rounded-2xl space-y-3 text-xs">
-                    <div className="flex items-start justify-between gap-3">
+                  <div className="bg-rose-50 border border-rose-200 text-rose-950 p-5 rounded-2xl space-y-4 text-xs shadow-sm">
+                    <div className="flex flex-col sm:flex-row items-start justify-between gap-3 border-b border-rose-200/80 pb-3">
                       <div className="flex items-start gap-2.5">
-                        <XCircle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+                        <ShieldAlert className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
                         <div>
-                          <p className="font-bold text-rose-900 text-sm">上传过程中断</p>
-                          <p className="text-rose-800 mt-0.5 leading-relaxed">{uploadError}</p>
+                          <div className="flex items-center gap-2">
+                            <span className="font-bold text-rose-900 text-sm">
+                              {errorDiagnostics?.title || '部署传输中断'}
+                            </span>
+                            {errorDiagnostics?.code && (
+                              <span className="font-mono text-[10px] bg-rose-200 text-rose-900 px-1.5 py-0.5 rounded font-semibold">
+                                {errorDiagnostics.code}
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-rose-800 mt-1 leading-relaxed">
+                            {errorDiagnostics?.reason || uploadError}
+                          </p>
                         </div>
                       </div>
+
                       <button
                         onClick={handleUploadToGithub}
                         disabled={isUploading}
-                        className="inline-flex items-center gap-1.5 bg-rose-900 hover:bg-rose-950 text-white font-bold px-4 py-2 rounded-xl transition shadow-sm shrink-0"
+                        className="inline-flex items-center gap-1.5 bg-rose-900 hover:bg-black text-white font-bold px-4 py-2.5 rounded-xl transition shadow-sm shrink-0 self-end sm:self-start disabled:opacity-50"
                       >
-                        <RefreshCw className="w-3.5 h-3.5" />
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin-reverse" />
                         <span>断点继续上传</span>
                       </button>
                     </div>
 
-                    <div className="bg-white/80 border border-rose-200/80 rounded-xl p-3 text-[11px] text-rose-900 space-y-1">
-                      <div className="font-semibold text-rose-950">💡 排查与断点续传说明：</div>
-                      <p>1. <strong>无需重新开始：</strong> 已成功上传的文件已被内存缓存记录，点击「断点继续上传」会<strong>自动跳过已上传文件</strong>，直接从失败处继续！</p>
-                      <p>2. <strong>手机网络波动：</strong> 移动端容易短暂丢包，多次重试会自动接续完成。</p>
-                      <p>3. <strong>权限检查：</strong> 请确认 GitHub Token 拥有 <code>repo</code> 或 <code>workflow</code> 权限，且仓库名无误。</p>
+                    {/* Step by step diagnostic solutions */}
+                    {errorDiagnostics?.steps && errorDiagnostics.steps.length > 0 && (
+                      <div className="bg-white/90 border border-rose-200/80 rounded-xl p-3.5 space-y-2 text-rose-950">
+                        <div className="font-bold flex items-center gap-1.5 text-xs text-rose-900">
+                          <Wrench className="w-3.5 h-3.5 text-rose-700" />
+                          <span>推荐排查与一键排障流程：</span>
+                        </div>
+                        <ul className="space-y-1.5 text-[11px] pl-1">
+                          {errorDiagnostics.steps.map((step, idx) => (
+                            <li key={idx} className="flex items-start gap-1.5 leading-relaxed">
+                              <span className="font-mono font-bold text-rose-700 shrink-0">{idx + 1}.</span>
+                              <div className="flex-1">
+                                <span>{step.text}</span>
+                                {step.linkUrl && (
+                                  <a
+                                    href={step.linkUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="ml-1 font-bold underline text-rose-900 hover:text-black inline-flex items-center gap-0.5"
+                                  >
+                                    [{step.linkText || '点击前往管理页'}] <ExternalLink className="w-2.5 h-2.5" />
+                                  </a>
+                                )}
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
+                    <div className="text-[11px] text-rose-800/90 flex items-center gap-1.5 pt-0.5">
+                      <LifeBuoy className="w-3.5 h-3.5 text-rose-600 shrink-0" />
+                      <span>遇到复杂问题？可以随时切换到上方【4. 报错与故障排查手册】查看所有错误对照表。</span>
                     </div>
                   </div>
                 )}
@@ -1546,24 +1764,38 @@ echo "https://\${USERNAME}.github.io/\${REPO}/"`;
                     <input
                       type="text"
                       value={fileSearch}
-                      onChange={(e) => setFileSearch(e.target.value)}
+                      onChange={(e) => {
+                        setFileSearch(e.target.value);
+                        setVisibleFileCount(100);
+                      }}
                       placeholder="搜索解压出的文件路径..."
                       className="w-full bg-[#f8f8f7] border border-neutral-200 rounded-xl pl-9 pr-3 py-1.5 text-xs text-neutral-800 focus:outline-none focus:border-neutral-800 transition"
                     />
                   </div>
                   <span className="text-[11px] text-neutral-400 font-mono">
-                    显示 {filteredFiles.length} / {extractedFiles.length} 项
+                    匹配 {filteredFiles.length} / {extractedFiles.length} 项
                   </span>
                 </div>
 
                 {/* File Tree List */}
                 <div className="bg-[#f8f8f7] border border-neutral-200/80 rounded-2xl p-3 max-h-56 overflow-y-auto font-mono text-xs text-neutral-700 divide-y divide-neutral-200/50">
-                  {filteredFiles.map((file, idx) => (
+                  {filteredFiles.slice(0, visibleFileCount).map((file, idx) => (
                     <div key={idx} className="py-1.5 px-2 flex items-center justify-between hover:bg-white rounded-xl transition">
                       <span className="truncate pr-4 text-neutral-800">{file.path}</span>
                       <span className="text-[11px] text-neutral-400 shrink-0">{(file.size / 1024).toFixed(1)} KB</span>
                     </div>
                   ))}
+                  {filteredFiles.length > visibleFileCount && (
+                    <div className="py-2 text-center pt-3">
+                      <button
+                        type="button"
+                        onClick={() => setVisibleFileCount(prev => prev + 300)}
+                        className="inline-flex items-center gap-1.5 text-xs font-semibold text-neutral-700 hover:text-black bg-white border border-neutral-200 px-4 py-1.5 rounded-xl transition shadow-sm"
+                      >
+                        <span>显示更多文件 (已载入 {visibleFileCount} / 剩余 {filteredFiles.length - visibleFileCount} 项)</span>
+                      </button>
+                    </div>
+                  )}
                   {filteredFiles.length === 0 && (
                     <div className="py-4 text-center text-neutral-400 text-xs">
                       未找到符合条件的文件
@@ -1677,50 +1909,248 @@ echo "https://\${USERNAME}.github.io/\${REPO}/"`;
           </div>
         )}
 
-        {/* TAB 4: FAQ */}
+        {/* TAB 4: Troubleshooting & FAQ */}
         {activeTab === 'faq' && (
-          <div className="bg-white rounded-[28px] border border-neutral-200/80 p-6 md:p-8 space-y-5 shadow-[0_8px_30px_rgb(0,0,0,0.03)] text-xs md:text-sm text-neutral-700">
-            <h3 className="text-base font-bold text-neutral-900 border-b border-neutral-100 pb-3">
-              常见问题与避坑提示
-            </h3>
-
-            <div className="space-y-4">
-              <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
-                <h4 className="font-bold text-neutral-900 text-xs md:text-sm">1. 为什么用这个网页可以解决以前传错文件夹的问题？</h4>
-                <p className="text-neutral-500 text-xs leading-relaxed">
-                  因为开启了“强制清空重置”选项后，程序在构造 Git 节点树时不会继承以前远端的旧文件节点，而是把当前 ZIP 文件树作为**唯一的源码全集**提交覆写，以前传错的各种多余路径和乱七八糟文件都会被一次性清除干干净净！
-                </p>
+          <div className="bg-white rounded-[28px] border border-neutral-200/80 p-6 md:p-8 space-y-6 shadow-[0_8px_30px_rgb(0,0,0,0.03)] text-xs md:text-sm text-neutral-700">
+            <div className="border-b border-neutral-100 pb-4 space-y-1">
+              <div className="flex items-center gap-2">
+                <ShieldAlert className="w-5 h-5 text-rose-600 shrink-0" />
+                <h3 className="text-base font-bold text-neutral-900">
+                  常见报错代码与自助排障全集
+                </h3>
               </div>
+              <p className="text-neutral-500 text-xs">
+                即便你在上学无法实时帮忙，朋友遇到任何报错也可以通过本对照表秒查秒解决！
+              </p>
+            </div>
 
-              <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
-                <h4 className="font-bold text-neutral-900 text-xs md:text-sm">2. 压缩包里面有一层总文件夹怎么办？</h4>
-                <p className="text-neutral-500 text-xs leading-relaxed">
-                  不用担心！本工具内部集成了自动嵌套提取算法，如果检测到你的 ZIP 压缩包内部只有一层总文件夹（例如 <code className="bg-white border px-1 py-0.5 rounded font-mono">my-project/index.html</code>），会自动帮你提炼出内部文件（自动打平变成根目录下的 <code className="bg-white border px-1 py-0.5 rounded font-mono">index.html</code>）。
-                </p>
-              </div>
+            {/* Error Encyclopedia Section */}
+            <div className="space-y-3">
+              <h4 className="font-bold text-neutral-900 text-xs md:text-sm flex items-center gap-1.5">
+                <Wrench className="w-4 h-4 text-neutral-800" />
+                所有报错类型速查表 (Top 10 Common Errors)
+              </h4>
 
-              <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
-                <h4 className="font-bold text-neutral-900 text-xs md:text-sm">3. 提示 "Git Repository is empty" 是什么意思？</h4>
-                <p className="text-neutral-500 text-xs leading-relaxed">
-                  这意味着你在 GitHub 上新建的仓库是**完全空白**的（没有勾选 "Add a README file"，里面 0 个 commit，连 <code className="bg-white border px-1 py-0.5 rounded font-mono">main</code> 默认分支都还没建立）。不用担心，直接用本网页拖入 ZIP 点击全量上传，系统会自动帮你建立初始提交并创建好 <code className="bg-white border px-1 py-0.5 rounded font-mono">main</code> 分支！
-                </p>
-              </div>
-
-              <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
-                <h4 className="font-bold text-neutral-900 text-xs md:text-sm">4. 为什么用 GitHub 链接打开网页会“白屏”？</h4>
-                <div className="text-neutral-500 text-xs leading-relaxed space-y-1.5">
-                  <p>主要有两个常见原因：</p>
-                  <p><strong>原因 ①：直接点击了仓库中的 index.html 源码链接。</strong><br />GitHub 代码页面（如 <code className="bg-white border px-1 py-0.5 rounded font-mono">github.com/xxx/xxx/blob/main/index.html</code>）只是源码查看器，不会运行 JS 脚本。你需要开启 <strong>GitHub Pages</strong> 才能生成预览网站！</p>
-                  <p><strong>如何在 GitHub 开启网页预览：</strong><br />进入 GitHub 目标仓库 -&gt; 点击 <strong>Settings</strong> -&gt; 左侧边栏 <strong>Pages</strong> -&gt; Source 选择 <strong>Deploy from a branch</strong>，Branch 选择 <strong>main</strong> / <strong>/ (root)</strong> 点击 Save。等 1 分钟后即可获得专属网址（如 <code className="bg-white border px-1 py-0.5 rounded font-mono">https://yourname.github.io/repo/</code>）。</p>
-                  <p><strong>原因 ②：静态资源路径 404 报错。</strong><br />传统打包默认使用绝对路径 <code className="bg-white border px-1 py-0.5 rounded font-mono">/assets/</code>，导致在 GitHub Pages 的子路径下找不到脚本。本项目已在配置中设置了 <code className="bg-white border px-1 py-0.5 rounded font-mono">base: './'</code> 相对路径，全量兼容 GitHub Pages 部署！</p>
+              <div className="grid grid-cols-1 gap-3.5">
+                
+                {/* Error 1 */}
+                <div className="bg-rose-50/50 border border-rose-200/80 p-4 rounded-2xl space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold text-rose-900 text-xs md:text-sm">
+                      1. 提示 <code>tree.sha ... is not a valid blob</code>（断点索引失效）
+                    </span>
+                    <span className="font-mono text-[10px] bg-rose-200/80 text-rose-900 px-2 py-0.5 rounded font-bold">
+                      ERR_CACHE_BLOB_EXPIRED
+                    </span>
+                  </div>
+                  <p className="text-neutral-600 text-xs leading-relaxed">
+                    <strong>原因：</strong> 传输中途网络掉线或手机切后台挂起，导致 GitHub 端的临时 Blob 块未正常持久化。
+                  </p>
+                  <div className="bg-white p-2.5 rounded-xl border border-rose-200/60 text-xs text-rose-950 font-medium">
+                    💡 <strong>解决办法：</strong> 无需重新拖入 ZIP 包，直接点击排错框中的<strong>「断点继续上传」</strong>按钮。网页会自动清除无效缓存并全量同步，秒级恢复！
+                  </div>
                 </div>
-              </div>
 
-              <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
-                <h4 className="font-bold text-neutral-900 text-xs md:text-sm">5. 以后开源代码需要注意什么？</h4>
-                <p className="text-neutral-500 text-xs leading-relaxed">
-                  本网页完全由纯前端运行（基于 GitHub 官方公开 REST API），你的 Token 只存在于你自己的浏览器内存中，绝对不会上传到任何中间服务器，你可以非常放心、安全地把本项目仓库开源或者分享给朋友使用！
-                </p>
+                {/* Error 2 */}
+                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
+                      2. 提示 <code>401 Bad Credentials</code> 或 Token 无效
+                    </span>
+                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
+                      ERR_TOKEN_401_INVALID
+                    </span>
+                  </div>
+                  <p className="text-neutral-600 text-xs leading-relaxed">
+                    <strong>原因：</strong> GitHub Token 复制错误、末尾包含了空格或换行，或者 Token 已过期/在 GitHub 端被删除了。
+                  </p>
+                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
+                    💡 <strong>解决办法：</strong> 重新在 GitHub 生成新 Token（开启 <code className="bg-neutral-100 px-1 py-0.5 rounded">repo</code> 权限），然后粘贴到网页顶部的 Token 输入框中。
+                  </div>
+                </div>
+
+                {/* Error 3 */}
+                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
+                      3. 提示 <code>404 Not Found</code> 找不到仓库
+                    </span>
+                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
+                      ERR_REPO_404_NOT_FOUND
+                    </span>
+                  </div>
+                  <p className="text-neutral-600 text-xs leading-relaxed">
+                    <strong>原因：</strong> 1. GitHub 用户名或仓库名拼写错误（区分大小写）；2. 仓库是私有仓库 (Private Repo)，但 Token 没勾选 repo 读写权限导致无法访问。
+                  </p>
+                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
+                    💡 <strong>解决办法：</strong> 确认用户名和仓库名无空格拼错，并在重新生成 Token 时勾选完整的 <code className="bg-neutral-100 px-1 py-0.5 rounded">repo</code> 读写权限。
+                  </div>
+                </div>
+
+                {/* Error 4 */}
+                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
+                      4. 提示 <code>403 Forbidden</code> 或 <code>Resource not accessible</code>
+                    </span>
+                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
+                      ERR_TOKEN_403_PERMISSION
+                    </span>
+                  </div>
+                  <p className="text-neutral-600 text-xs leading-relaxed">
+                    <strong>原因：</strong> 使用了 GitHub 新版细粒度 Token (Fine-grained PAT)，但未给予 Repository contents 写入支持。
+                  </p>
+                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
+                    💡 <strong>解决办法：</strong> 前往 GitHub Token 设置，将 <code className="bg-neutral-100 px-1 py-0.5 rounded">Repository permissions -&gt; Contents</code> 设置为 <strong>Read and write (读与写)</strong>。
+                  </div>
+                </div>
+
+                {/* Error 5 */}
+                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
+                      5. 提示 <code>Protected branch</code>（分支保护限制）
+                    </span>
+                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
+                      ERR_BRANCH_PROTECTION
+                    </span>
+                  </div>
+                  <p className="text-neutral-600 text-xs leading-relaxed">
+                    <strong>原因：</strong> 仓库的分支（如 <code className="bg-neutral-100 px-1 py-0.5 rounded">main</code>）开启了分支保护规则（Branch protection rule），禁止直接强制覆写。
+                  </p>
+                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
+                    💡 <strong>解决办法：</strong> 前往仓库 <code className="bg-neutral-100 px-1 py-0.5 rounded">Settings -&gt; Branches</code> 暂时解禁保护规则，或者将上面的「目标分支名」修改为 <code className="bg-neutral-100 px-1 py-0.5 rounded">gh-pages</code> 部署到新分支。
+                  </div>
+                </div>
+
+                {/* Error 6 */}
+                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
+                      6. 提示 <code>429 Rate Limit Exceeded</code>（接口限流）
+                    </span>
+                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
+                      ERR_API_RATE_LIMIT
+                    </span>
+                  </div>
+                  <p className="text-neutral-600 text-xs leading-relaxed">
+                    <strong>原因：</strong> 项目小文件过多或短期内发送 API 较多，触发了 GitHub 的平滑防刷限制。
+                  </p>
+                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
+                    💡 <strong>解决办法：</strong> 静置等待 30 秒，然后点击「断点继续上传」即可继续，网页已内置自动缓释和降频重试机制。
+                  </div>
+                </div>
+
+                {/* Error 7 */}
+                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
+                      7. GitHub Pages 页面找不到 Save 按钮或开启后白屏
+                    </span>
+                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
+                      PAGES_NO_SAVE_BUTTON
+                    </span>
+                  </div>
+                  <p className="text-neutral-600 text-xs leading-relaxed">
+                    <strong>原因：</strong> 当将 Build and deployment 切换为 GitHub Actions 时，配置是<strong>自动保存生效</strong>的，所以不会出现 Save 按钮；网页白屏通常是项目资源路径使用了绝对路径。
+                  </p>
+                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
+                    💡 <strong>解决办法：</strong> 上传成功后直接点击网页面板里的<strong>「⚡ 网页 API 一键开启 Pages &amp; 启动 Actions」</strong>即可自动拉起打包；同时静态项目打包时请保持相对路径（如 <code className="bg-neutral-100 px-1 py-0.5 rounded">base: './'</code>）。
+                  </div>
+                </div>
+
+                {/* Error 8 */}
+                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
+                      8. 提示 <code>422 Tree cannot be empty</code>（文件树为空）
+                    </span>
+                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
+                      ERR_TREE_EMPTY
+                    </span>
+                  </div>
+                  <p className="text-neutral-600 text-xs leading-relaxed">
+                    <strong>原因：</strong> ZIP 压缩包内只有系统垃圾文件（如 <code className="bg-neutral-100 px-1 py-0.5 rounded">.DS_Store</code>）或者为空压缩包，净化过滤后没有剩余有效代码文件。
+                  </p>
+                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
+                    💡 <strong>解决办法：</strong> 重新打包代码 ZIP，确保压缩包内包含正常的源码文件或 <code className="bg-neutral-100 px-1 py-0.5 rounded">index.html</code>。
+                  </div>
+                </div>
+
+                {/* Error 9 */}
+                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
+                      9. 手机上传提示 <code>Failed to fetch / NetworkError</code>
+                    </span>
+                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
+                      ERR_NETWORK_ABORT
+                    </span>
+                  </div>
+                  <p className="text-neutral-600 text-xs leading-relaxed">
+                    <strong>原因：</strong> 手机端切去微信回复消息或屏幕休眠锁屏，浏览器暂停了后台 JS 脚本与网络请求。
+                  </p>
+                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
+                    💡 <strong>解决办法：</strong> 返回浏览器，点击<strong>「断点继续上传」</strong>，系统会自动续传未完成部分。传输期间保持手机亮屏在前台即可。
+                  </div>
+                </div>
+
+                {/* Error 10 */}
+                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
+                      10. GitHub Actions 运行报错 <code>Process completed with exit code 1</code>
+                    </span>
+                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
+                      ERR_WORKFLOW_FAILED
+                    </span>
+                  </div>
+                  <p className="text-neutral-600 text-xs leading-relaxed">
+                    <strong>原因：</strong> GitHub 仓库默认的 Actions 工作流权限受限（只读模式），导致部署构建被拒。
+                  </p>
+                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
+                    💡 <strong>解决办法：</strong> 进入 GitHub 仓库 <code className="bg-neutral-100 px-1 py-0.5 rounded">Settings -&gt; Actions -&gt; General</code>，下拉到最底部的 <strong>Workflow permissions</strong>，勾选 <strong>Read and write permissions</strong>，然后保存！
+                  </div>
+                </div>
+
+              </div>
+            </div>
+
+            {/* General Guidance Section */}
+            <div className="pt-4 border-t border-neutral-100 space-y-4">
+              <h4 className="font-bold text-neutral-900 text-xs md:text-sm flex items-center gap-1.5">
+                <BookOpen className="w-4 h-4 text-neutral-800" />
+                常见核心问答 (FAQ)
+              </h4>
+
+              <div className="space-y-3">
+                <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
+                  <h5 className="font-bold text-neutral-900 text-xs">为什么用这个网页可以解决以前传错文件夹的问题？</h5>
+                  <p className="text-neutral-500 text-xs leading-relaxed">
+                    因为开启了“强制清空重置”选项后，程序在构造 Git 节点树时不会继承以前远端的旧文件节点，而是把当前 ZIP 文件树作为**唯一的源码全集**提交覆写，以前传错的各种多余路径和乱七八糟文件都会被一次性清除干干净净！
+                  </p>
+                </div>
+
+                <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
+                  <h5 className="font-bold text-neutral-900 text-xs">压缩包里面有一层总文件夹怎么办？</h5>
+                  <p className="text-neutral-500 text-xs leading-relaxed">
+                    不用担心！本工具内部集成了自动嵌套提取算法，如果检测到你的 ZIP 压缩包内部只有一层总文件夹（例如 <code className="bg-white border px-1 py-0.5 rounded font-mono">my-project/index.html</code>），会自动帮你提炼出内部文件（自动打平变成根目录下的 <code className="bg-white border px-1 py-0.5 rounded font-mono">index.html</code>）。
+                  </p>
+                </div>
+
+                <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
+                  <h5 className="font-bold text-neutral-900 text-xs">提示 "Git Repository is empty" 是什么意思？</h5>
+                  <p className="text-neutral-500 text-xs leading-relaxed">
+                    这意味着你在 GitHub 上新建的仓库是**完全空白**的（没有勾选 "Add a README file"，里面 0 个 commit，连 <code className="bg-white border px-1 py-0.5 rounded font-mono">main</code> 默认分支都还没建立）。不用担心，直接用本网页拖入 ZIP 点击全量上传，系统会自动帮你建立初始提交并创建好 <code className="bg-white border px-1 py-0.5 rounded font-mono">main</code> 分支！
+                  </p>
+                </div>
+
+                <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
+                  <h5 className="font-bold text-neutral-900 text-xs">安全保障与隐私声明</h5>
+                  <p className="text-neutral-500 text-xs leading-relaxed">
+                    本网页完全由纯前端运行（基于 GitHub 官方公开 REST API），你的 Token 只存在于你自己的浏览器内存中，绝对不会上传到任何中间服务器，你可以非常放心、安全地把本项目仓库开源或者分享给朋友使用！
+                  </p>
+                </div>
               </div>
             </div>
           </div>
