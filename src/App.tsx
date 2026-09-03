@@ -298,6 +298,36 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'browser-upload' | 'termux-script' | 'github-action' | 'faq'>('browser-upload');
   const [showGuide, setShowGuide] = useState<boolean>(true);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [isRefreshingSite, setIsRefreshingSite] = useState<boolean>(false);
+
+  // Force update app / clear browser cache & hard reload
+  const handleForceUpdateSite = async () => {
+    setIsRefreshingSite(true);
+    try {
+      // 1. Unregister service workers if any
+      if ('serviceWorker' in navigator) {
+        const registrations = await navigator.serviceWorker.getRegistrations();
+        for (const registration of registrations) {
+          await registration.unregister();
+        }
+      }
+      // 2. Clear browser CacheStorage
+      if ('caches' in window) {
+        const cacheNames = await caches.keys();
+        await Promise.all(cacheNames.map((name) => caches.delete(name)));
+      }
+      // 3. Clear session storage
+      sessionStorage.clear();
+    } catch (err) {
+      console.warn('清空浏览器缓存失败:', err);
+    } finally {
+      // 4. Force hard reload using timestamp query param to bypass HTTP cache
+      setTimeout(() => {
+        const cleanUrl = window.location.protocol + "//" + window.location.host + window.location.pathname;
+        window.location.href = cleanUrl + '?v=' + Date.now();
+      }, 300);
+    }
+  };
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -342,6 +372,16 @@ export default function App() {
     }
   };
 
+  const sanitizeGitPath = (rawPath: string): string => {
+    if (!rawPath) return '';
+    const normalized = rawPath.replace(/\\/g, '/');
+    const parts = normalized
+      .split('/')
+      .map(p => p.trim())
+      .filter(p => p.length > 0 && p !== '.' && p !== '..');
+    return parts.join('/');
+  };
+
   // Handle ZIP selection & extraction
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     try {
@@ -383,22 +423,55 @@ export default function App() {
     setVisibleFileCount(100);
 
     try {
+      const decodeZipFileName = (bytes: Uint8Array): string => {
+        try {
+          return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        } catch {
+          try {
+            return new TextDecoder('gbk').decode(bytes);
+          } catch {
+            return new TextDecoder().decode(bytes);
+          }
+        }
+      };
+
       const zip = new JSZip();
-      const zipContent = await zip.loadAsync(file);
+      const zipContent = await zip.loadAsync(file, { decodeFileName: decodeZipFileName });
       const fileList: ExtractedFile[] = [];
 
-      const paths = Object.keys(zipContent.files);
-      const nonDirPaths = paths.filter(p => !zipContent.files[p].dir);
+      const rawPaths = Object.keys(zipContent.files);
 
-      // Detect if all files are inside a single outer folder wrapper
+      // Pre-filter valid non-junk files
+      const validEntries = rawPaths.filter(relativePath => {
+        const zipEntry = zipContent.files[relativePath];
+        if (zipEntry.dir || relativePath.endsWith('/')) return false;
+
+        const normalized = relativePath.replace(/\\/g, '/');
+        const filename = normalized.split('/').pop() || '';
+
+        if (
+          normalized.includes('__MACOSX/') ||
+          normalized.startsWith('.git/') ||
+          normalized.includes('/.git/') ||
+          filename === '.DS_Store' ||
+          filename === 'Thumbs.db' ||
+          filename === 'desktop.ini'
+        ) {
+          return false;
+        }
+        return true;
+      });
+
+      // Detect root prefix (e.g., 'ZY3/')
       let rootPrefix = '';
-      if (nonDirPaths.length > 0) {
-        const firstParts = nonDirPaths[0].split('/');
+      if (validEntries.length > 0) {
+        const firstNormalized = validEntries[0].replace(/\\/g, '/');
+        const firstParts = firstNormalized.split('/');
         if (firstParts.length > 1) {
-          const potentialPrefix = firstParts[0] + '/';
-          const allSharePrefix = nonDirPaths.every(p => p.startsWith(potentialPrefix));
-          if (allSharePrefix) {
-            rootPrefix = potentialPrefix;
+          const candidatePrefix = firstParts[0] + '/';
+          const allShare = validEntries.every(p => p.replace(/\\/g, '/').startsWith(candidatePrefix));
+          if (allShare) {
+            rootPrefix = candidatePrefix;
           }
         }
       }
@@ -408,37 +481,45 @@ export default function App() {
 
       for (const relativePath of Object.keys(zipContent.files)) {
         const zipEntry = zipContent.files[relativePath];
-        if (zipEntry.dir) continue;
+        if (zipEntry.dir || relativePath.endsWith('/')) continue;
+
+        const normalized = relativePath.replace(/\\/g, '/');
+        const filename = normalized.split('/').pop() || '';
 
         // Ignore macOS, Windows, Git metadata junk files
-        const filename = relativePath.split('/').pop() || '';
         if (
-          relativePath.includes('__MACOSX/') ||
-          relativePath.endsWith('.DS_Store') ||
+          normalized.includes('__MACOSX/') ||
+          normalized.endsWith('.DS_Store') ||
           filename === '.DS_Store' ||
           filename === 'Thumbs.db' ||
           filename === 'desktop.ini' ||
-          relativePath.startsWith('.git/') ||
-          relativePath.includes('/.git/')
+          normalized.startsWith('.git/') ||
+          normalized.includes('/.git/')
         ) {
           junkCount++;
           continue;
         }
 
         // Conditionally filter node_modules
-        if (relativePath.startsWith('node_modules/') || relativePath.includes('/node_modules/')) {
+        if (normalized.startsWith('node_modules/') || normalized.includes('/node_modules/')) {
           nodeModulesCount++;
           if (skipNodeModules) {
             continue;
           }
         }
 
-        let cleanPath = relativePath;
+        let cleanPath = normalized;
         if (rootPrefix && cleanPath.startsWith(rootPrefix)) {
           cleanPath = cleanPath.substring(rootPrefix.length);
         }
 
+        cleanPath = sanitizeGitPath(cleanPath);
         if (!cleanPath) continue;
+
+        // Prevent duplicate paths
+        if (fileList.some(f => f.path === cleanPath)) {
+          continue;
+        }
 
         try {
           const contentUint8 = await zipEntry.async('uint8array');
@@ -778,10 +859,8 @@ jobs:
 
         for (let i = 0; i < extractedFiles.length; i++) {
           const file = extractedFiles[i];
-          const normalizedPath = file.path
-            .replace(/\\/g, '/')
-            .replace(/^\.\//, '')
-            .replace(/^\/+/, '');
+          const normalizedPath = sanitizeGitPath(file.path);
+          if (!normalizedPath) continue;
 
           const cacheKey = `${cleanUsername}/${cleanRepo}:${normalizedPath}_${file.size}`;
           let blobSha = useCache ? blobShaCacheRef.current.get(cacheKey) : undefined;
@@ -1135,6 +1214,15 @@ echo "https://\${USERNAME}.github.io/\${REPO}/"`;
                 <span className="text-[10px] font-mono font-medium text-neutral-500 bg-neutral-100 px-2 py-0.5 rounded-full border border-neutral-200">
                   Monochrome Edition
                 </span>
+                <button
+                  type="button"
+                  onClick={handleForceUpdateSite}
+                  disabled={isRefreshingSite}
+                  className="p-1 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition active:scale-90 flex items-center justify-center"
+                  title="强制刷新页面并清除浏览器缓存"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingSite ? 'animate-spin text-neutral-900' : ''}`} />
+                </button>
               </div>
             </div>
           </div>
@@ -2113,6 +2201,24 @@ echo "https://\${USERNAME}.github.io/\${REPO}/"`;
                   </div>
                 </div>
 
+                {/* Error 11 */}
+                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
+                      11. 浏览器存在旧缓存，导致看到的还是旧版网页
+                    </span>
+                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
+                      CACHE_STALE_PAGE
+                    </span>
+                  </div>
+                  <p className="text-neutral-600 text-xs leading-relaxed">
+                    <strong>原因：</strong> 浏览器默认对静态网页资源（JS/CSS）有长时间强缓存或 ServiceWorker 离线缓存，导致代码更新后浏览器仍在使用本地旧文件。
+                  </p>
+                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
+                    💡 <strong>解决办法：</strong> 直接点击网页顶部 Logo 旁边的<strong>刷新图标 🔄</strong>，系统会自动擦除离线缓存并带时间戳强制拉取最新网页。
+                  </div>
+                </div>
+
               </div>
             </div>
 
@@ -2155,6 +2261,22 @@ echo "https://\${USERNAME}.github.io/\${REPO}/"`;
             </div>
           </div>
         )}
+
+        {/* Subtle Footer */}
+        <footer className="pt-8 pb-4 text-center text-xs text-neutral-400 space-y-1.5 border-t border-neutral-200/60">
+          <p className="font-mono text-[11px]">zipdeploy monochrome • client-side pure static tool</p>
+          <div className="flex items-center justify-center gap-3 text-[11px]">
+            <button
+              type="button"
+              onClick={handleForceUpdateSite}
+              disabled={isRefreshingSite}
+              className="inline-flex items-center gap-1 text-neutral-500 hover:text-neutral-900 transition underline underline-offset-2"
+            >
+              <RefreshCw className={`w-3 h-3 ${isRefreshingSite ? 'animate-spin' : ''}`} />
+              <span>{isRefreshingSite ? '正在清除缓存并更新...' : '遇到缓存问题？强制更新网页'}</span>
+            </button>
+          </div>
+        </footer>
 
       </main>
     </div>
