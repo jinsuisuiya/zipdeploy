@@ -1,204 +1,697 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import JSZip from 'jszip';
-import { 
-  Upload, 
-  FileArchive, 
-  CheckCircle2, 
-  XCircle, 
-  Key, 
-  User, 
-  Github, 
-  Mail, 
-  GitBranch, 
-  FileText, 
-  Terminal, 
-  Copy, 
-  Check, 
-  ArrowRight, 
-  RefreshCw, 
-  FolderTree, 
-  ExternalLink,
-  Code2,
-  FileCode,
-  Eye,
-  EyeOff,
-  HelpCircle,
-  ChevronDown,
-  ChevronUp,
-  ArrowUpRight,
-  Search,
-  Trash2,
-  Zap,
-  Play,
-  Save,
-  ShieldCheck,
-  CheckCircle,
-  AlertTriangle,
-  LifeBuoy,
-  ShieldAlert,
-  Wrench,
+import {
+  Menu,
   BookOpen,
-  Info,
-  Lock
+  Github,
+  ArrowUpRight,
+  Sun,
+  Moon
 } from 'lucide-react';
+import {
+  analyzeError,
+  type ExtractedFile,
+  type UploadLog,
+  type ErrorDiagnostics
+} from './data/knowledgeBase';
+import {
+  uint8ToBase64Fast,
+  computeGitBlobSha,
+  scanFilesForSecrets,
+  type WorkspaceProfile,
+  type SecurityFinding,
+  type TokenCheckResult,
+  type ActionRunInfo,
+  type CommitHistoryItem
+} from './utils/deployHelpers';
+import { Sidebar, type ActiveView } from './components/Sidebar';
+import { QuickDrawer, type QuickDrawerTab } from './components/QuickDrawer';
+import { DeployWorkspace } from './components/DeployWorkspace';
+import { GuideView } from './components/GuideView';
+import { ScriptsView } from './components/ScriptsView';
+import { FaqView } from './components/FaqView';
+import { WelcomeModal } from './components/WelcomeModal';
+import { SecurityWarningModal } from './components/SecurityWarningModal';
+import { FilePreviewModal } from './components/FilePreviewModal';
+import { RollbackModal } from './components/RollbackModal';
+import { CreateRepoModal } from './components/CreateRepoModal';
 
-interface ExtractedFile {
-  path: string;
-  size: number;
-  isDir: boolean;
-  content: Uint8Array;
-}
+const VIEW_TITLES: Record<ActiveView, string> = {
+  deploy: '部署工作台',
+  guide: '三分钟教程',
+  scripts: '脚本与 Actions',
+  faq: '排障百科'
+};
 
-interface UploadLog {
-  id: string;
-  time: string;
-  message: string;
-  status: 'pending' | 'success' | 'error' | 'info';
-}
-
-interface SolutionStep {
-  text: string;
-  linkText?: string;
-  linkUrl?: string;
-}
-
-interface ErrorDiagnostics {
-  code: string;
-  title: string;
-  reason: string;
-  steps: SolutionStep[];
-  retryHint?: string;
-}
-
-function analyzeError(rawError: string, username: string, repo: string, branch: string): ErrorDiagnostics {
-  const lower = rawError.toLowerCase();
-
-  // 1. Invalid Blob / Cache Expired
-  if (lower.includes('is not a valid blob') || lower.includes('invalid blob')) {
-    return {
-      code: 'ERR_CACHE_BLOB_EXPIRED',
-      title: '缓存文件索引失效',
-      reason: '由于网络中断或断点记录过期，GitHub 端的缓存索引失效。已为您自动清空过期缓存。',
-      steps: [
-        { text: '点击下方「断点继续上传」按钮，系统会自动跳过已验证块，全量重发无效缓存文件。' },
-        { text: '传输过程中请尽量保持页面在前台，避免手机息屏挂起网络。' }
-      ],
-      retryHint: '直接点击下方「断点继续上传」即可自动清除并恢复部署。'
-    };
-  }
-
-  // 2. Protected Branch
-  if (lower.includes('protected branch') || lower.includes('branch is protected') || lower.includes('push is restricted')) {
-    return {
-      code: 'ERR_BRANCH_PROTECTION',
-      title: `分支 [${branch || 'main'}] 启用了分支保护规则 (Protected Branch)`,
-      reason: 'GitHub 仓库默认启用了分支保护规则（例如禁止 Force Push 或强制要求 Pull Request），导致强制全量提交被拒绝。',
-      steps: [
-        { 
-          text: '解法 ①（推荐）：前往 GitHub 仓库设置暂时关闭保护规则', 
-          linkText: `管理 ${username || 'repo'}/${repo || 'name'} 的 Branches 设置`, 
-          linkUrl: `https://github.com/${username}/${repo}/settings/branches` 
-        },
-        { text: '在 Branch protection rules 中找到对应的规则，点击 Edit 按钮，暂时取消勾选规则，或勾选「Allow force pushes」。' },
-        { text: '解法 ②：将顶部的「目标分支名」修改为 gh-pages 后重新提交，部署到一个独立的分支。' }
-      ]
-    };
-  }
-
-  // 3. Fine-grained PAT / Token permissions 403
-  if (lower.includes('resource not accessible by integration') || (lower.includes('403') && !lower.includes('rate limit'))) {
-    return {
-      code: 'ERR_TOKEN_403_PERMISSION',
-      title: 'GitHub Access Token 权限不足 (403 Forbidden)',
-      reason: '使用的 GitHub Access Token 缺少对仓库代码写入的权限，或者使用了新版 Fine-grained Token 但未勾选 Contents 读写支持。',
-      steps: [
-        { 
-          text: '若使用 Fine-grained Token (细粒度 Token)，请去 GitHub 个人 Token 管理设置', 
-          linkText: '查看 Fine-grained Tokens', 
-          linkUrl: 'https://github.com/settings/tokens?type=beta' 
-        },
-        { text: '编辑该 Token，在 Repository permissions 中将「Contents」选项改为 Read and write (读与写)。' },
-        { 
-          text: '若使用 Classic Token (经典 Token)，请前往经典 Token 列表', 
-          linkText: '查看 Classic Tokens', 
-          linkUrl: 'https://github.com/settings/tokens' 
-        },
-        { text: '确保勾选了最顶部的 「repo」(完整仓库控制权限)。' }
-      ]
-    };
-  }
-
-  // 4. Bad Credentials / 401
-  if (lower.includes('401') || lower.includes('bad credentials')) {
-    return {
-      code: 'ERR_TOKEN_401_INVALID',
-      title: 'GitHub Access Token 无效或已过期 (401 Unauthorized)',
-      reason: '填写的 Token 复制错误、遗漏了前缀 `ghp_`，或者该 Token 已被撤销或到了设定的过期时间。',
-      steps: [
-        { text: '请检查顶部「GitHub Personal Access Token」文本框，确保复制粘贴完整无多余空格。' },
-        { 
-          text: '若 Token 已失效，点击右侧链接重新生成全新 Token', 
-          linkText: '生成包含 repo 权限的新 Token', 
-          linkUrl: 'https://github.com/settings/tokens/new?scopes=repo&description=deploy-tool' 
-        }
-      ]
-    };
-  }
-
-  // 5. 404 Repo Not Found
-  if (lower.includes('404')) {
-    return {
-      code: 'ERR_REPO_404_NOT_FOUND',
-      title: '未找到目标仓库 (404 Not Found)',
-      reason: `无法找到目标仓库 [${username}/${repo}]。可能原因：1. 用户名或仓库名拼写大小写有误；2. 这是私有仓库 (Private Repo)，但 Token 没勾选 repo 读写权限。`,
-      steps: [
-        { text: `核对目标用户名是否为 [${username}]，仓库名是否为 [${repo}]（严禁多填斜杠或空格）。` },
-        { text: '在浏览器中测试仓库链接是否可访问：', linkText: `打开 https://github.com/${username}/${repo}`, linkUrl: `https://github.com/${username}/${repo}` },
-        { text: '若确认是私有仓库，请重新生成勾选了 repo 权限的 Token 后在网页重试。' }
-      ]
-    };
-  }
-
-  // 6. Rate Limit / 429
-  if (lower.includes('rate limit') || lower.includes('secondary rate') || lower.includes('429')) {
-    return {
-      code: 'ERR_API_RATE_LIMIT',
-      title: '触发 GitHub API 频次风控 (API Rate Limit)',
-      reason: '短时间内发送了较多 API 请求，触发了 GitHub 的防刷保护机制。',
-      steps: [
-        { text: '不用担心，本系统内置了自动平滑退避机制。' },
-        { text: '请静置等待 30 秒至 1 分钟，然后直接点击下方「断点继续上传」即可接续完成。' }
-      ]
-    };
-  }
-
-  // Default fallback
-  return {
-    code: 'ERR_UNKNOWN_DEPLOY',
-    title: '网络传输中断或提交异常',
-    reason: rawError,
-    steps: [
-      { text: '1. 检查网络连接，避免移动端锁屏或切换 App 导致网络挂起。' },
-      { text: '2. 检查 GitHub Token 读写权限与仓库名拼写是否完全匹配。' },
-      { text: '3. 点击下方「断点继续上传」按钮重试，系统会从上一次中断处秒级恢复。' }
-    ]
-  };
-}
+const WELCOME_STORAGE_KEY = 'zd_welcome_accepted_v1';
+const PROFILES_STORAGE_KEY = 'zd_profiles_v1';
+const ACTIVE_PROFILE_STORAGE_KEY = 'zd_active_profile_v1';
 
 export default function App() {
-  // Config States (Persisted locally for user convenience)
+  // Welcome / First-Visit Safety Notice Modal
+  const [hasAcceptedWelcome, setHasAcceptedWelcome] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(WELCOME_STORAGE_KEY) === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [welcomeModalOpen, setWelcomeModalOpen] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(WELCOME_STORAGE_KEY) !== 'true';
+    } catch {
+      return true;
+    }
+  });
+
+  const handleAcceptWelcome = () => {
+    try {
+      localStorage.setItem(WELCOME_STORAGE_KEY, 'true');
+    } catch {
+      // ignore
+    }
+    setHasAcceptedWelcome(true);
+    setWelcomeModalOpen(false);
+  };
+
+  // Theme State (Light / Dark)
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    try {
+      const saved = localStorage.getItem('zd_theme');
+      if (saved === 'dark' || saved === 'light') return saved;
+      return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    } catch {
+      return 'light';
+    }
+  });
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === 'dark') {
+      root.classList.add('dark');
+    } else {
+      root.classList.remove('dark');
+    }
+    try {
+      localStorage.setItem('zd_theme', theme);
+    } catch {
+      // ignore
+    }
+  }, [theme]);
+
+  const toggleTheme = () => {
+    setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
+  };
+
+  // Config States
   const [token, setToken] = useState<string>(() => localStorage.getItem('zd_token') || '');
   const [showToken, setShowToken] = useState<boolean>(false);
   const [username, setUsername] = useState<string>(() => localStorage.getItem('zd_username') || 'your-username');
   const [repo, setRepo] = useState<string>(() => localStorage.getItem('zd_repo') || 'your-repository');
   const [email, setEmail] = useState<string>(() => localStorage.getItem('zd_email') || 'user@example.com');
   const [branch, setBranch] = useState<string>(() => localStorage.getItem('zd_branch') || 'main');
+  const [targetSubdir, setTargetSubdir] = useState<string>(() => localStorage.getItem('zd_subdir') || '');
   const [commitMessage, setCommitMessage] = useState<string>('refactor: auto deploy unzipped contents');
   const [forcePush, setForcePush] = useState<boolean>(true);
   const [saveLocally, setSaveLocally] = useState<boolean>(true);
   const [autoInjectPagesAction, setAutoInjectPagesAction] = useState<boolean>(true);
   const [pagesStatus, setPagesStatus] = useState<string | null>(null);
   const [isTriggeringPages, setIsTriggeringPages] = useState<boolean>(false);
+
+  // Workspace Profiles
+  const [profiles, setProfiles] = useState<WorkspaceProfile[]>(() => {
+    try {
+      const raw = localStorage.getItem(PROFILES_STORAGE_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [activeProfileId, setActiveProfileId] = useState<string>(() => {
+    try {
+      return localStorage.getItem(ACTIVE_PROFILE_STORAGE_KEY) || '';
+    } catch {
+      return '';
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(PROFILES_STORAGE_KEY, JSON.stringify(profiles));
+      localStorage.setItem(ACTIVE_PROFILE_STORAGE_KEY, activeProfileId);
+    } catch {
+      // ignore
+    }
+  }, [profiles, activeProfileId]);
+
+  const handleSelectProfile = (id: string) => {
+    setActiveProfileId(id);
+    if (!id) return;
+    const found = profiles.find((p) => p.id === id);
+    if (found) {
+      setUsername(found.username);
+      setRepo(found.repo);
+      setEmail(found.email);
+      setBranch(found.branch);
+      setTargetSubdir(found.targetSubdir);
+      setCommitMessage(found.commitMessage);
+      setForcePush(found.forcePush);
+      setAutoInjectPagesAction(found.autoInjectPagesAction);
+    }
+  };
+
+  const handleSaveProfile = (name: string) => {
+    const id = `prof_${Date.now()}`;
+    const newProfile: WorkspaceProfile = {
+      id,
+      name,
+      username: username.trim() || 'your-username',
+      repo: repo.trim() || 'your-repository',
+      email: email.trim() || 'user@example.com',
+      branch: branch.trim() || 'main',
+      targetSubdir: targetSubdir.trim(),
+      commitMessage: commitMessage.trim() || 'refactor: auto deploy unzipped contents',
+      forcePush,
+      autoInjectPagesAction
+    };
+    setProfiles((prev) => [...prev, newProfile]);
+    setActiveProfileId(id);
+  };
+
+  const handleDeleteProfile = (id: string) => {
+    setProfiles((prev) => prev.filter((p) => p.id !== id));
+    if (activeProfileId === id) {
+      setActiveProfileId('');
+    }
+  };
+
+  // Token Permission & Rate Limit Check
+  const [isCheckingToken, setIsCheckingToken] = useState<boolean>(false);
+  const [tokenCheckResult, setTokenCheckResult] = useState<TokenCheckResult | null>(null);
+
+  useEffect(() => {
+    setTokenCheckResult(null);
+  }, [token]);
+
+  const handleCheckToken = async () => {
+    const cleanToken = token.trim();
+    if (!cleanToken) return;
+    setIsCheckingToken(true);
+    setTokenCheckResult(null);
+
+    const headers = {
+      Authorization: `Bearer ${cleanToken}`,
+      Accept: 'application/vnd.github+json'
+    };
+
+    try {
+      const userRes = await fetch('https://api.github.com/user', { headers });
+      const rateRemainingHeader = userRes.headers.get('x-ratelimit-remaining');
+      const rateLimitHeader = userRes.headers.get('x-ratelimit-limit');
+      const scopesHeader = userRes.headers.get('x-oauth-scopes') || '';
+
+      const rateRemaining = rateRemainingHeader !== null ? Number(rateRemainingHeader) : undefined;
+      const rateLimit = rateLimitHeader !== null ? Number(rateLimitHeader) : undefined;
+
+      if (!userRes.ok) {
+        setTokenCheckResult({
+          status: 'error',
+          rateRemaining,
+          rateLimit,
+          message:
+            userRes.status === 401
+              ? 'Token 无效或已过期 (401 Unauthorized)，请核对或重新生成。'
+              : `校验失败 (${userRes.status})，请检查网络连接或 Token 状态。`
+        });
+        return;
+      }
+
+      const userData = await userRes.json().catch(() => ({}));
+      const login = userData.login as string | undefined;
+
+      // Check target repo write permissions if repo is configured
+      let repoWritable: boolean | null = null;
+      const cleanU = username.trim();
+      const cleanR = repo.trim();
+      if (cleanU && cleanU !== 'your-username' && cleanR && cleanR !== 'your-repository') {
+        const repoRes = await fetch(`https://api.github.com/repos/${cleanU}/${cleanR}`, { headers });
+        if (repoRes.ok) {
+          const repoData = await repoRes.json().catch(() => ({}));
+          repoWritable = Boolean(repoData?.permissions?.push);
+        } else if (repoRes.status === 404) {
+          setTokenCheckResult({
+            status: 'warning',
+            login,
+            scopes: scopesHeader,
+            rateRemaining,
+            rateLimit,
+            repoWritable: false,
+            repoNotFound: true,
+            message: `Token 有效，但未找到仓库 [${cleanU}/${cleanR}] (404) 或无权访问私有仓库。`
+          });
+          return;
+        }
+      }
+
+      const scopeList = scopesHeader
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const isClassicMissingRepo = scopesHeader !== '' && !scopeList.includes('repo');
+
+      if (isClassicMissingRepo) {
+        setTokenCheckResult({
+          status: 'warning',
+          login,
+          scopes: scopesHeader,
+          rateRemaining,
+          rateLimit,
+          repoWritable,
+          message: 'Token 有效但未检测到 repo 完整权限，推送代码时可能被拒绝 (403)。'
+        });
+      } else if (repoWritable === false) {
+        setTokenCheckResult({
+          status: 'warning',
+          login,
+          scopes: scopesHeader,
+          rateRemaining,
+          rateLimit,
+          repoWritable,
+          message: `Token 有效，但当前账号对目标仓库 [${cleanU}/${cleanR}] 缺少写入权限。`
+        });
+      } else {
+        setTokenCheckResult({
+          status: 'ok',
+          login,
+          scopes: scopesHeader,
+          rateRemaining,
+          rateLimit,
+          repoWritable,
+          message:
+            repoWritable === true
+              ? `Token 权限正常，已确认具备 [${cleanU}/${cleanR}] 写入权限。`
+              : 'Token 校验通过，可正常调用 GitHub API。'
+        });
+      }
+    } catch (err: any) {
+      setTokenCheckResult({
+        status: 'error',
+        message: `网络检测失败: ${err.message || '请检查网络连接'}`
+      });
+    } finally {
+      setIsCheckingToken(false);
+    }
+  };
+
+  // Save settings to localStorage
+  useEffect(() => {
+    if (saveLocally) {
+      if (token) localStorage.setItem('zd_token', token);
+      if (username) localStorage.setItem('zd_username', username);
+      if (repo) localStorage.setItem('zd_repo', repo);
+      if (email) localStorage.setItem('zd_email', email);
+      if (branch) localStorage.setItem('zd_branch', branch);
+      localStorage.setItem('zd_subdir', targetSubdir);
+    }
+  }, [token, username, repo, email, branch, targetSubdir, saveLocally]);
+
+  // File Extraction States
+  const [zipFile, setZipFile] = useState<File | null>(null);
+  const [extractedFiles, setExtractedFiles] = useState<ExtractedFile[]>([]);
+  const [isUnzipping, setIsUnzipping] = useState<boolean>(false);
+  const [unzipError, setUnzipError] = useState<string | null>(null);
+  const [fileSearch, setFileSearch] = useState<string>('');
+  const [visibleFileCount, setVisibleFileCount] = useState<number>(100);
+  const [ignoreNodeModules, setIgnoreNodeModules] = useState<boolean>(true);
+  const [filterStats, setFilterStats] = useState<{ junkCount: number; nodeModulesCount: number }>({
+    junkCount: 0,
+    nodeModulesCount: 0
+  });
+  const [previewFile, setPreviewFile] = useState<ExtractedFile | null>(null);
+
+  // Upload Progress & Secret Scan States
+  const [isUploading, setIsUploading] = useState<boolean>(false);
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [currentStepText, setCurrentStepText] = useState<string>('');
+  const [logs, setLogs] = useState<UploadLog[]>([]);
+  const [uploadSuccess, setUploadSuccess] = useState<boolean>(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [errorDiagnostics, setErrorDiagnostics] = useState<ErrorDiagnostics | null>(null);
+  const [securityFindings, setSecurityFindings] = useState<SecurityFinding[]>([]);
+
+  // Live GitHub Actions Status Tracker
+  const [latestActionRun, setLatestActionRun] = useState<ActionRunInfo | null>(null);
+  const [isPollingActions, setIsPollingActions] = useState<boolean>(false);
+
+  // Rollback Modal States
+  const [rollbackModalOpen, setRollbackModalOpen] = useState<boolean>(false);
+  const [rollbackCommits, setRollbackCommits] = useState<CommitHistoryItem[]>([]);
+  const [isLoadingCommits, setIsLoadingCommits] = useState<boolean>(false);
+  const [rollbackError, setRollbackError] = useState<string | null>(null);
+  const [isRollingBack, setIsRollingBack] = useState<boolean>(false);
+  const [rollbackSuccessSha, setRollbackSuccessSha] = useState<string | null>(null);
+
+  // Create Repository Modal States
+  const [createRepoModalOpen, setCreateRepoModalOpen] = useState<boolean>(false);
+  const [isCreatingRepo, setIsCreatingRepo] = useState<boolean>(false);
+  const [createRepoError, setCreateRepoError] = useState<string | null>(null);
+  const [createdRepoSuccessName, setCreatedRepoSuccessName] = useState<string | null>(null);
+
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (isUploading) {
+        e.preventDefault();
+        e.returnValue = '文件部署上传中，离开或刷新页面可能会中断当前传输！';
+        return e.returnValue;
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [isUploading]);
+
+  // Navigation & Drawer UI States
+  const [activeView, setActiveView] = useState<ActiveView>('deploy');
+  const [mobileNavOpen, setMobileNavOpen] = useState<boolean>(false);
+  const [quickDrawerTab, setQuickDrawerTab] = useState<QuickDrawerTab>(null);
+  const [quickDrawerQuery, setQuickDrawerQuery] = useState<string>('');
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [isRefreshingSite, setIsRefreshingSite] = useState<boolean>(false);
+
+  const openQuickDrawer = (tab: Exclude<QuickDrawerTab, null>, query = '') => {
+    setQuickDrawerQuery(query);
+    setQuickDrawerTab(tab);
+  };
+
+  const handleForceUpdateSite = async () => {
+    setIsRefreshingSite(true);
+    try {
+      if ('serviceWorker' in navigator) {
+        const registrations = await navigator.serviceWorker.getRegistrations();
+        for (const registration of registrations) {
+          await registration.unregister();
+        }
+      }
+      if ('caches' in window) {
+        const cacheNames = await caches.keys();
+        await Promise.all(cacheNames.map((name) => caches.delete(name)));
+      }
+      sessionStorage.clear();
+    } catch (err) {
+      console.warn('清空浏览器缓存失败:', err);
+    } finally {
+      setTimeout(() => {
+        const cleanUrl = window.location.protocol + '//' + window.location.host + window.location.pathname;
+        window.location.href = cleanUrl + '?v=' + Date.now();
+      }, 300);
+    }
+  };
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const addLog = (message: string, status: 'pending' | 'success' | 'error' | 'info' = 'info') => {
+    const timeStr = new Date().toLocaleTimeString();
+    setLogs((prev) => [...prev, { id: Math.random().toString(), time: timeStr, message, status }]);
+  };
+
+  // Fetch latest GitHub Actions run
+  const fetchLatestActionRun = useCallback(async (): Promise<ActionRunInfo | null> => {
+    const cleanToken = token.trim();
+    const cleanU = username.trim();
+    const cleanR = repo.trim();
+    if (!cleanToken || !cleanU || !cleanR || cleanU === 'your-username' || cleanR === 'your-repository') {
+      return null;
+    }
+
+    try {
+      const res = await fetch(`https://api.github.com/repos/${cleanU}/${cleanR}/actions/runs?per_page=1`, {
+        headers: {
+          Authorization: `Bearer ${cleanToken}`,
+          Accept: 'application/vnd.github+json'
+        }
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      const run = data?.workflow_runs?.[0];
+      if (!run) return null;
+
+      const parsed: ActionRunInfo = {
+        id: run.id,
+        name: run.name || 'Workflow',
+        status: run.status,
+        conclusion: run.conclusion,
+        html_url: run.html_url,
+        created_at: run.created_at,
+        updated_at: run.updated_at
+      };
+      setLatestActionRun(parsed);
+      return parsed;
+    } catch {
+      return null;
+    }
+  }, [token, username, repo]);
+
+  // Poll Actions while active after upload success
+  useEffect(() => {
+    if (!uploadSuccess) {
+      setIsPollingActions(false);
+      return;
+    }
+
+    let cancelled = false;
+    let pollCount = 0;
+    const maxPolls = 24; // ~2 mins max
+    setIsPollingActions(true);
+
+    const tick = async () => {
+      if (cancelled) return;
+      pollCount++;
+      const run = await fetchLatestActionRun();
+      if (cancelled) return;
+      if ((run && run.status === 'completed') || pollCount >= maxPolls) {
+        setIsPollingActions(false);
+        return;
+      }
+      setTimeout(tick, 5000);
+    };
+
+    const initialTimer = setTimeout(tick, 2500);
+    return () => {
+      cancelled = true;
+      clearTimeout(initialTimer);
+    };
+  }, [uploadSuccess, fetchLatestActionRun]);
+
+  // Rollback handlers
+  const fetchCommitHistory = async () => {
+    const cleanToken = token.trim();
+    const cleanU = username.trim();
+    const cleanR = repo.trim();
+    const cleanB = branch.trim() || 'main';
+
+    if (!cleanToken || !cleanU || !cleanR || cleanU === 'your-username' || cleanR === 'your-repository') {
+      setRollbackError('请先填写有效的 GitHub Token、用户名与仓库名。');
+      setRollbackCommits([]);
+      return;
+    }
+
+    setIsLoadingCommits(true);
+    setRollbackError(null);
+    setRollbackSuccessSha(null);
+
+    try {
+      const res = await fetch(
+        `https://api.github.com/repos/${cleanU}/${cleanR}/commits?sha=${encodeURIComponent(cleanB)}&per_page=8`,
+        {
+          headers: {
+            Authorization: `Bearer ${cleanToken}`,
+            Accept: 'application/vnd.github+json'
+          }
+        }
+      );
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData?.message || `读取历史失败 (${res.status})`);
+      }
+
+      const data = await res.json();
+      const mapped: CommitHistoryItem[] = Array.isArray(data)
+        ? data.map((item: any) => ({
+            sha: item.sha,
+            message: item.commit?.message || '(无提交说明)',
+            authorName: item.commit?.author?.name || item.author?.login || 'Unknown',
+            date: item.commit?.author?.date || '',
+            htmlUrl: item.html_url
+          }))
+        : [];
+      setRollbackCommits(mapped);
+    } catch (err: any) {
+      setRollbackError(err.message || '拉取提交记录失败');
+    } finally {
+      setIsLoadingCommits(false);
+    }
+  };
+
+  const handleOpenRollback = () => {
+    setRollbackModalOpen(true);
+    fetchCommitHistory();
+  };
+
+  const handleRollbackToSha = async (sha: string) => {
+    const cleanToken = token.trim();
+    const cleanU = username.trim();
+    const cleanR = repo.trim();
+    const cleanB = branch.trim() || 'main';
+
+    setIsRollingBack(true);
+    setRollbackError(null);
+    setRollbackSuccessSha(null);
+
+    try {
+      const res = await fetch(
+        `https://api.github.com/repos/${cleanU}/${cleanR}/git/refs/heads/${encodeURIComponent(cleanB)}`,
+        {
+          method: 'PATCH',
+          headers: {
+            Authorization: `Bearer ${cleanToken}`,
+            Accept: 'application/vnd.github+json',
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ sha, force: true })
+        }
+      );
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData?.message || `回滚失败 (${res.status})`);
+      }
+
+      setRollbackSuccessSha(sha);
+      await fetchCommitHistory();
+    } catch (err: any) {
+      setRollbackError(err.message || '执行分支回滚时出现错误');
+    } finally {
+      setIsRollingBack(false);
+    }
+  };
+
+  // One-click Create GitHub Repository
+  const handleOpenCreateRepo = () => {
+    setCreateRepoError(null);
+    setCreatedRepoSuccessName(null);
+    setCreateRepoModalOpen(true);
+  };
+
+  const handleCreateRepo = async ({
+    name,
+    description,
+    isPrivate,
+    autoPushAfterCreate
+  }: {
+    name: string;
+    description: string;
+    isPrivate: boolean;
+    autoPushAfterCreate: boolean;
+  }) => {
+    const cleanToken = token.trim();
+    if (!cleanToken) {
+      setCreateRepoError('请先在配置区填入您的 GitHub Access Token (PAT) 后再新建仓库。');
+      return;
+    }
+
+    setIsCreatingRepo(true);
+    setCreateRepoError(null);
+    setCreatedRepoSuccessName(null);
+
+    const headers = {
+      Authorization: `Bearer ${cleanToken}`,
+      Accept: 'application/vnd.github+json',
+      'Content-Type': 'application/json'
+    };
+
+    try {
+      // Determine authenticated user to decide personal vs org repo endpoint
+      const userRes = await fetch('https://api.github.com/user', { headers });
+      if (!userRes.ok) {
+        if (userRes.status === 401) {
+          throw new Error('GitHub Token 无效或已过期 (401)，请检查后重试。');
+        }
+        throw new Error(`无法验证当前 GitHub 账号 (${userRes.status})。`);
+      }
+
+      const userData = await userRes.json();
+      const authLogin = userData.login as string;
+      const cleanFormUser = username.trim();
+      const useOrgEndpoint =
+        cleanFormUser &&
+        cleanFormUser !== 'your-username' &&
+        cleanFormUser.toLowerCase() !== authLogin.toLowerCase();
+
+      const endpoint = useOrgEndpoint
+        ? `https://api.github.com/orgs/${encodeURIComponent(cleanFormUser)}/repos`
+        : 'https://api.github.com/user/repos';
+
+      const createRes = await fetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          name,
+          description: description || 'Deployed via zipdeploy',
+          private: isPrivate,
+          auto_init: false
+        })
+      });
+
+      if (!createRes.ok) {
+        const errData = await createRes.json().catch(() => ({}));
+        if (createRes.status === 404 && useOrgEndpoint) {
+          throw new Error(
+            `未找到组织 [${cleanFormUser}] 或无权创建仓库。若要创建个人仓库，请将用户名改为 [${authLogin}]。`
+          );
+        }
+        if (createRes.status === 422) {
+          throw new Error(
+            `仓库名 [${name}] 已存在或格式不符合 GitHub 规范（只允许字母、数字、点、下划线与连字符）。`
+          );
+        }
+        if (createRes.status === 403) {
+          throw new Error('Token 权限不足 (403)，请确保 Token 勾选了 repo 完整控制权限。');
+        }
+        throw new Error(formatApiError(errData, `创建仓库失败 (${createRes.status})`));
+      }
+
+      const created = await createRes.json();
+      const createdOwner = created?.owner?.login || authLogin;
+      const createdName = created?.name || name;
+      const fullName = created?.full_name || `${createdOwner}/${createdName}`;
+
+      setUsername(createdOwner);
+      setRepo(createdName);
+      setUploadError(null);
+      setErrorDiagnostics(null);
+      setTokenCheckResult({
+        status: 'ok',
+        login: authLogin,
+        repoWritable: true,
+        message: `新仓库 [${fullName}] 已创建成功并具备写入权限。`
+      });
+      setCreatedRepoSuccessName(fullName);
+
+      if (autoPushAfterCreate && extractedFiles.length > 0) {
+        setCreateRepoModalOpen(false);
+        const findings = scanFilesForSecrets(extractedFiles);
+        if (findings.length > 0) {
+          setSecurityFindings(findings);
+        } else {
+          executeUploadToGithub({ overrideUsername: createdOwner, overrideRepo: createdName });
+        }
+      }
+    } catch (err: any) {
+      setCreateRepoError(err.message || '创建仓库时发生未知错误');
+    } finally {
+      setIsCreatingRepo(false);
+    }
+  };
 
   const triggerPagesAutoSetup = async () => {
     if (!token || !username || !repo) return;
@@ -228,20 +721,26 @@ export default function App() {
       }
 
       if (pagesRes.ok || pagesRes.status === 204) {
-        addLog('✅ 已成功通过 API 将 GitHub Pages 切换为 Actions 构建模式！', 'success');
+        addLog('已成功通过 API 将 GitHub Pages 切换为 Actions 构建模式', 'success');
       }
 
-      const dispatchRes = await fetch(`https://api.github.com/repos/${username}/${repo}/actions/workflows/deploy-pages.yml/dispatches`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ ref: branch })
-      });
+      const dispatchRes = await fetch(
+        `https://api.github.com/repos/${username}/${repo}/actions/workflows/deploy-pages.yml/dispatches`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ ref: branch })
+        }
+      );
 
       if (dispatchRes.ok || dispatchRes.status === 204) {
-        addLog('🚀 成功触发 GitHub Actions 云端打包与上线，等待约 1 分钟即可访问！', 'success');
-        setPagesStatus('🎉 全自动触发成功！已为你通过 API 开启 Pages 并启动云端打包！等待 1 分钟左右刷新网址即可。');
+        addLog('成功触发 GitHub Actions 云端打包与上线，上方追踪器将持续同步进度', 'success');
+        setPagesStatus('全自动触发成功！已开启 Pages 并启动云端打包，等待约 1 分钟刷新网址即可。');
+        setTimeout(() => {
+          fetchLatestActionRun();
+        }, 1500);
       } else {
-        setPagesStatus('Pages 模式已配置下发！请去 Actions 标签页或者刷新网页预览。');
+        setPagesStatus('Pages 模式已配置下发，请前往 Actions 标签页或稍后刷新预览。');
       }
     } catch (e: any) {
       console.error(e);
@@ -251,105 +750,23 @@ export default function App() {
     }
   };
 
-  // Save settings to localStorage
-  useEffect(() => {
-    if (saveLocally) {
-      if (token) localStorage.setItem('zd_token', token);
-      if (username) localStorage.setItem('zd_username', username);
-      if (repo) localStorage.setItem('zd_repo', repo);
-      if (email) localStorage.setItem('zd_email', email);
-      if (branch) localStorage.setItem('zd_branch', branch);
-    }
-  }, [token, username, repo, email, branch, saveLocally]);
-
-  // File Extraction States
-  const [zipFile, setZipFile] = useState<File | null>(null);
-  const [extractedFiles, setExtractedFiles] = useState<ExtractedFile[]>([]);
-  const [isUnzipping, setIsUnzipping] = useState<boolean>(false);
-  const [unzipError, setUnzipError] = useState<string | null>(null);
-  const [fileSearch, setFileSearch] = useState<string>('');
-  const [visibleFileCount, setVisibleFileCount] = useState<number>(100);
-  const [ignoreNodeModules, setIgnoreNodeModules] = useState<boolean>(true);
-  const [filterStats, setFilterStats] = useState<{ junkCount: number; nodeModulesCount: number }>({ junkCount: 0, nodeModulesCount: 0 });
-
-  // Upload Progress States
-  const [isUploading, setIsUploading] = useState<boolean>(false);
-  const [uploadProgress, setUploadProgress] = useState<number>(0);
-  const [currentStepText, setCurrentStepText] = useState<string>('');
-  const [logs, setLogs] = useState<UploadLog[]>([]);
-  const [uploadSuccess, setUploadSuccess] = useState<boolean>(false);
-  const [uploadError, setUploadError] = useState<string | null>(null);
-  const [errorDiagnostics, setErrorDiagnostics] = useState<ErrorDiagnostics | null>(null);
-
-  // Prevent accidental page navigation or closing during upload
-  useEffect(() => {
-    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-      if (isUploading) {
-        e.preventDefault();
-        e.returnValue = '文件部署上传中，离开或刷新页面可能会中断当前传输！';
-        return e.returnValue;
-      }
-    };
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-  }, [isUploading]);
-
-  // Navigation & UI States
-  const [activeTab, setActiveTab] = useState<'browser-upload' | 'termux-script' | 'github-action' | 'faq'>('browser-upload');
-  const [showGuide, setShowGuide] = useState<boolean>(true);
-  const [copiedKey, setCopiedKey] = useState<string | null>(null);
-  const [isRefreshingSite, setIsRefreshingSite] = useState<boolean>(false);
-
-  // Force update app / clear browser cache & hard reload
-  const handleForceUpdateSite = async () => {
-    setIsRefreshingSite(true);
-    try {
-      // 1. Unregister service workers if any
-      if ('serviceWorker' in navigator) {
-        const registrations = await navigator.serviceWorker.getRegistrations();
-        for (const registration of registrations) {
-          await registration.unregister();
-        }
-      }
-      // 2. Clear browser CacheStorage
-      if ('caches' in window) {
-        const cacheNames = await caches.keys();
-        await Promise.all(cacheNames.map((name) => caches.delete(name)));
-      }
-      // 3. Clear session storage
-      sessionStorage.clear();
-    } catch (err) {
-      console.warn('清空浏览器缓存失败:', err);
-    } finally {
-      // 4. Force hard reload using timestamp query param to bypass HTTP cache
-      setTimeout(() => {
-        const cleanUrl = window.location.protocol + "//" + window.location.host + window.location.pathname;
-        window.location.href = cleanUrl + '?v=' + Date.now();
-      }, 300);
-    }
-  };
-
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
-  const addLog = (message: string, status: 'pending' | 'success' | 'error' | 'info' = 'info') => {
-    const timeStr = new Date().toLocaleTimeString();
-    setLogs(prev => [...prev, { id: Math.random().toString(), time: timeStr, message, status }]);
-  };
-
   const handleClearSaved = () => {
     localStorage.removeItem('zd_token');
     localStorage.removeItem('zd_username');
     localStorage.removeItem('zd_repo');
     localStorage.removeItem('zd_email');
     localStorage.removeItem('zd_branch');
+    localStorage.removeItem('zd_subdir');
     setToken('');
     setUsername('your-username');
     setRepo('your-repository');
     setEmail('user@example.com');
     setBranch('main');
+    setTargetSubdir('');
+    setActiveProfileId('');
+    setTokenCheckResult(null);
   };
 
-  // Generate a sample ZIP in memory for testing
   const handleGenerateSampleZip = async () => {
     setIsUnzipping(true);
     setUnzipError(null);
@@ -359,12 +776,15 @@ export default function App() {
 
     try {
       const zip = new JSZip();
-      zip.file("index.html", "<!DOCTYPE html>\n<html>\n<head>\n  <title>Sample Site</title>\n</head>\n<body>\n  <h1>Hello from ZipDeploy!</h1>\n</body>\n</html>");
-      zip.file("css/style.css", "body { background: #f7f7f6; font-family: sans-serif; }");
-      zip.file("README.md", "# Sample Project\nDeployed via ZipDeploy Studio.");
+      zip.file(
+        'index.html',
+        '<!DOCTYPE html>\n<html>\n<head>\n  <title>Sample Site</title>\n</head>\n<body>\n  <h1>Hello from ZipDeploy!</h1>\n</body>\n</html>'
+      );
+      zip.file('css/style.css', 'body { background: #f8f8f7; font-family: sans-serif; }');
+      zip.file('README.md', '# Sample Project\nDeployed via ZipDeploy.');
 
-      const blob = await zip.generateAsync({ type: "blob" });
-      const sampleFile = new File([blob], "demo-sample-project.zip", { type: "application/zip" });
+      const blob = await zip.generateAsync({ type: 'blob' });
+      const sampleFile = new File([blob], 'demo-sample-project.zip', { type: 'application/zip' });
       await processZipFile(sampleFile);
     } catch (err: any) {
       setIsUnzipping(false);
@@ -377,12 +797,11 @@ export default function App() {
     const normalized = rawPath.replace(/\\/g, '/');
     const parts = normalized
       .split('/')
-      .map(p => p.trim())
-      .filter(p => p.length > 0 && p !== '.' && p !== '..');
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0 && p !== '.' && p !== '..');
     return parts.join('/');
   };
 
-  // Handle ZIP selection & extraction
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     try {
       const file = e.target.files?.[0];
@@ -419,6 +838,7 @@ export default function App() {
     setUnzipError(null);
     setUploadSuccess(false);
     setUploadError(null);
+    setLatestActionRun(null);
     setLogs([]);
     setVisibleFileCount(100);
 
@@ -441,8 +861,7 @@ export default function App() {
 
       const rawPaths = Object.keys(zipContent.files);
 
-      // Pre-filter valid non-junk files
-      const validEntries = rawPaths.filter(relativePath => {
+      const validEntries = rawPaths.filter((relativePath) => {
         const zipEntry = zipContent.files[relativePath];
         if (zipEntry.dir || relativePath.endsWith('/')) return false;
 
@@ -462,14 +881,13 @@ export default function App() {
         return true;
       });
 
-      // Detect root prefix (e.g., 'ZY3/')
       let rootPrefix = '';
       if (validEntries.length > 0) {
         const firstNormalized = validEntries[0].replace(/\\/g, '/');
         const firstParts = firstNormalized.split('/');
         if (firstParts.length > 1) {
           const candidatePrefix = firstParts[0] + '/';
-          const allShare = validEntries.every(p => p.replace(/\\/g, '/').startsWith(candidatePrefix));
+          const allShare = validEntries.every((p) => p.replace(/\\/g, '/').startsWith(candidatePrefix));
           if (allShare) {
             rootPrefix = candidatePrefix;
           }
@@ -486,7 +904,6 @@ export default function App() {
         const normalized = relativePath.replace(/\\/g, '/');
         const filename = normalized.split('/').pop() || '';
 
-        // Ignore macOS, Windows, Git metadata junk files
         if (
           normalized.includes('__MACOSX/') ||
           normalized.endsWith('.DS_Store') ||
@@ -500,7 +917,6 @@ export default function App() {
           continue;
         }
 
-        // Conditionally filter node_modules
         if (normalized.startsWith('node_modules/') || normalized.includes('/node_modules/')) {
           nodeModulesCount++;
           if (skipNodeModules) {
@@ -516,8 +932,7 @@ export default function App() {
         cleanPath = sanitizeGitPath(cleanPath);
         if (!cleanPath) continue;
 
-        // Prevent duplicate paths
-        if (fileList.some(f => f.path === cleanPath)) {
+        if (fileList.some((f) => f.path === cleanPath)) {
           continue;
         }
 
@@ -534,10 +949,9 @@ export default function App() {
         }
       }
 
-      // Auto inject GitHub Pages build & deploy workflow for React/Vite source projects
       if (autoInjectPagesAction) {
         const workflowPath = '.github/workflows/deploy-pages.yml';
-        if (!fileList.some(f => f.path === workflowPath)) {
+        if (!fileList.some((f) => f.path === workflowPath)) {
           const pagesWorkflowYaml = `name: Deploy site to GitHub Pages
 
 on:
@@ -635,30 +1049,18 @@ jobs:
     }
   };
 
-  // Convert Uint8Array to Base64 safely without stack overflow
-  const uint8ToBase64 = (uint8: Uint8Array): string => {
-    let binary = '';
-    const len = uint8.length;
-    const chunkSize = 1024; // 1024 is completely safe for arguments stack on mobile browsers and webviews
-    for (let i = 0; i < len; i += chunkSize) {
-      const chunk = uint8.subarray(i, Math.min(i + chunkSize, len));
-      binary += String.fromCharCode.apply(null, chunk as any);
-    }
-    return btoa(binary);
-  };
-
-  // Cache for uploaded blob SHAs to support instant resumable upload
   const blobShaCacheRef = useRef<Map<string, string>>(new Map());
 
-  // Helper to extract detailed GitHub API error messages
   const formatApiError = (errData: any, fallbackMessage: string): string => {
     if (errData && errData.errors && Array.isArray(errData.errors) && errData.errors.length > 0) {
-      const details = errData.errors.map((e: any) => {
-        if (typeof e === 'string') return e;
-        if (e.message) return e.message;
-        if (e.field) return `${e.field}: ${e.code || 'invalid'}`;
-        return JSON.stringify(e);
-      }).join(', ');
+      const details = errData.errors
+        .map((e: any) => {
+          if (typeof e === 'string') return e;
+          if (e.message) return e.message;
+          if (e.field) return `${e.field}: ${e.code || 'invalid'}`;
+          return JSON.stringify(e);
+        })
+        .join(', ');
       return `${errData.message || fallbackMessage} (${details})`;
     }
     if (errData && errData.message) {
@@ -667,12 +1069,13 @@ jobs:
     return fallbackMessage;
   };
 
-  // Resilient fetch with automatic retries, timeout, and rate-limit backoff
+  // Resilient fetch with retries, timeout, and rate-limit callback
   const robustFetch = async (
     url: string,
     options: RequestInit,
     maxRetries = 4,
-    timeoutMs = 35000
+    timeoutMs = 35000,
+    onRateLimitHit?: () => void
   ): Promise<Response> => {
     let lastError: any = null;
 
@@ -687,26 +1090,26 @@ jobs:
         });
         clearTimeout(timeoutId);
 
-        // Check for GitHub Rate Limit (403 secondary rate limit or 429)
         if (response.status === 429 || (response.status === 403 && !response.ok)) {
           const clone = response.clone();
           const errJson = await clone.json().catch(() => ({}));
-          const isRateLimit = errJson?.message?.toLowerCase().includes('rate limit') ||
-                              errJson?.message?.toLowerCase().includes('abuse') ||
-                              errJson?.message?.toLowerCase().includes('secondary');
+          const isRateLimit =
+            errJson?.message?.toLowerCase().includes('rate limit') ||
+            errJson?.message?.toLowerCase().includes('abuse') ||
+            errJson?.message?.toLowerCase().includes('secondary');
 
           if (isRateLimit && attempt < maxRetries) {
-            const retryAfter = Number(response.headers.get('retry-after')) || (attempt * 2 + 1);
-            addLog(`⚠️ 触发 GitHub API 频率保护，智能等待 ${retryAfter} 秒后第 ${attempt} 次自动重试...`, 'info');
-            await new Promise(r => setTimeout(r, retryAfter * 1000));
+            onRateLimitHit?.();
+            const retryAfter = Number(response.headers.get('retry-after')) || attempt * 2 + 1;
+            addLog(`触发 GitHub API 频率保护，自动降速并等待 ${retryAfter} 秒后重试...`, 'info');
+            await new Promise((r) => setTimeout(r, retryAfter * 1000));
             continue;
           }
         }
 
-        // Server errors (500, 502, 503, 504) -> auto retry
         if ([500, 502, 503, 504].includes(response.status) && attempt < maxRetries) {
-          addLog(`⚠️ GitHub 服务端返回 ${response.status}，等待 2 秒后第 ${attempt} 次自动重试...`, 'info');
-          await new Promise(r => setTimeout(r, 2000 * attempt));
+          addLog(`GitHub 服务端返回 ${response.status}，等待 2 秒后第 ${attempt} 次自动重试...`, 'info');
+          await new Promise((r) => setTimeout(r, 2000 * attempt));
           continue;
         }
 
@@ -715,12 +1118,12 @@ jobs:
         clearTimeout(timeoutId);
         lastError = err;
         const isAbort = err.name === 'AbortError';
-        const msg = isAbort ? '请求超时 (35s)' : (err.message || '网络连接波动');
-        
+        const msg = isAbort ? '请求超时 (35s)' : err.message || '网络连接波动';
+
         if (attempt < maxRetries) {
           const delay = attempt * 1500;
-          addLog(`⚠️ 网络连接波动 (${msg})，${(delay / 1000).toFixed(1)} 秒后第 ${attempt} 次自动重试...`, 'info');
-          await new Promise(r => setTimeout(r, delay));
+          addLog(`网络连接波动 (${msg})，${(delay / 1000).toFixed(1)} 秒后第 ${attempt} 次自动重试...`, 'info');
+          await new Promise((r) => setTimeout(r, delay));
         }
       }
     }
@@ -728,8 +1131,8 @@ jobs:
     throw lastError || new Error('网络请求多次重试失败，请检查网络或 GitHub 服务状态');
   };
 
-  // Direct GitHub REST API Deployment
-  const handleUploadToGithub = async () => {
+  // Pre-upload entry point: runs secret scan first, asks confirmation if findings exist
+  const handleInitiateUpload = () => {
     const cleanToken = token.trim();
     if (!cleanToken) {
       setUploadError('请先填入您的 GitHub Personal Access Token (PAT) 密钥');
@@ -743,10 +1146,9 @@ jobs:
       cleanUsername = parts[0];
       cleanRepo = parts[1];
     }
-    const cleanBranch = branch.trim() || 'main';
 
     if (!cleanUsername || cleanUsername === 'your-username' || !cleanRepo || cleanRepo === 'your-repository') {
-      setUploadError('请在上方填写您实际的 GitHub 用户名与仓库名称');
+      setUploadError('请在配置栏填写您实际的 GitHub 用户名与仓库名称');
       return;
     }
     if (extractedFiles.length === 0) {
@@ -754,52 +1156,83 @@ jobs:
       return;
     }
 
+    const findings = scanFilesForSecrets(extractedFiles);
+    if (findings.length > 0) {
+      setSecurityFindings(findings);
+      return;
+    }
+
+    executeUploadToGithub();
+  };
+
+  // Core concurrent upload pipeline
+  const executeUploadToGithub = async (overrides?: { overrideUsername?: string; overrideRepo?: string }) => {
+    setSecurityFindings([]);
+    const cleanToken = token.trim();
+
+    const rawUser = overrides?.overrideUsername ?? username;
+    const rawRepo = overrides?.overrideRepo ?? repo;
+    let cleanUsername = rawUser.trim().replace(/^https?:\/\/github\.com\//i, '').replace(/^\/+/, '').split('/')[0];
+    let cleanRepo = rawRepo.trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/i, '').replace(/^\/+/, '');
+    if (cleanRepo.includes('/')) {
+      const parts = cleanRepo.split('/');
+      cleanUsername = parts[0];
+      cleanRepo = parts[1];
+    }
+    const cleanBranch = branch.trim() || 'main';
+    const cleanSubdir = sanitizeGitPath(targetSubdir);
+
     setIsUploading(true);
     setUploadSuccess(false);
     setUploadError(null);
     setErrorDiagnostics(null);
+    setLatestActionRun(null);
     setUploadProgress(5);
 
     const headers = {
-      'Authorization': `Bearer ${cleanToken}`,
-      'Accept': 'application/vnd.github.v3+json',
-      'Content-Type': 'application/json',
+      Authorization: `Bearer ${cleanToken}`,
+      Accept: 'application/vnd.github.v3+json',
+      'Content-Type': 'application/json'
     };
 
     try {
-      addLog(`🚀 开始连接 GitHub 目标仓库: ${cleanUsername}/${cleanRepo} (${cleanBranch} 分支)`, 'info');
+      addLog(
+        `开始连接 GitHub 目标仓库: ${cleanUsername}/${cleanRepo} (${cleanBranch} 分支${
+          cleanSubdir ? ` · 子目录 ${cleanSubdir}/` : ''
+        })`,
+        'info'
+      );
 
-      // 0. Pre-flight Check: Verify Token and Repository Access
       setCurrentStepText('正在预检 GitHub 目标仓库访问权限...');
       const repoUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}`;
       const repoCheckRes = await robustFetch(repoUrl, { headers }, 2, 8000);
-      
+
       if (!repoCheckRes.ok) {
         if (repoCheckRes.status === 401) {
           throw new Error('GitHub PAT Token 无效或已被撤销，请检查 Token 并重新输入');
         } else if (repoCheckRes.status === 404) {
-          throw new Error(`未找到目标仓库 [${cleanUsername}/${cleanRepo}]。请检查：1. 用户名与仓库名拼写 2. 若为私有仓库，需确保 PAT Token 勾选了 repo 权限`);
+          throw new Error(
+            `未找到目标仓库 [${cleanUsername}/${cleanRepo}]。请检查：1. 用户名与仓库名拼写 2. 若为私有仓库，需确保 PAT Token 勾选了 repo 权限`
+          );
         } else if (repoCheckRes.status === 403) {
           throw new Error('PAT Token 权限不足或被 GitHub 限流，请确认创建 Token 时勾选了 repo 读写权限');
         }
       } else {
         const repoData = await repoCheckRes.json().catch(() => ({}));
         if (repoData.private) {
-          addLog(`🔒 目标仓库为私有仓库 (Private Repo)，已确认 Access Token 权限有效`, 'info');
+          addLog('目标仓库为私有仓库 (Private Repo)，已确认 Access Token 权限有效', 'info');
         }
       }
 
-      // Check for oversized files (> 50MB)
-      const oversized = extractedFiles.filter(f => f.size > 50 * 1024 * 1024);
+      const oversized = extractedFiles.filter((f) => f.size > 50 * 1024 * 1024);
       if (oversized.length > 0) {
-        const names = oversized.map(f => f.path).join(', ');
-        addLog(`⚠️ 警告: 检测到大文件超过 50MB [${names}]，GitHub REST API 传输此类大文件可能失败`, 'info');
+        const names = oversized.map((f) => f.path).join(', ');
+        addLog(`警告: 检测到大文件超过 50MB [${names}]，GitHub REST API 传输此类大文件可能失败`, 'info');
       }
 
-      // 1. Get HEAD ref
       setCurrentStepText('正在读取 GitHub 仓库分支 HEAD 状态...');
       const refUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/ref/heads/${cleanBranch}`;
-      
+
       let parentCommitSha: string | null = null;
       try {
         const refRes = await robustFetch(refUrl, { headers }, 2, 10000);
@@ -814,28 +1247,30 @@ jobs:
         addLog(`检查分支状态跳过 (将作为新提交处理): ${err.message || ''}`, 'info');
       }
 
-      // If parentCommitSha is null (empty repo or non-existent branch), initialize via Contents API
       if (!parentCommitSha) {
-        addLog(`检测到目标仓库无基准提交，正在自动初始化首个 Commit 节点...`, 'info');
+        addLog('检测到目标仓库无基准提交，正在自动初始化首个 Commit 节点...', 'info');
         setCurrentStepText('正在建立仓库初始提交...');
 
         const initUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/contents/.gitkeep`;
-        const initRes = await robustFetch(initUrl, {
-          method: 'PUT',
-          headers,
-          body: JSON.stringify({
-            message: commitMessage.trim() || 'initial commit',
-            content: btoa('# Initialized by ZipDeploy'),
-            branch: cleanBranch
-          })
-        }, 3);
+        const initRes = await robustFetch(
+          initUrl,
+          {
+            method: 'PUT',
+            headers,
+            body: JSON.stringify({
+              message: commitMessage.trim() || 'initial commit',
+              content: btoa('# Initialized by ZipDeploy'),
+              branch: cleanBranch
+            })
+          },
+          3
+        );
 
         if (!initRes.ok && initRes.status !== 422) {
           const errData = await initRes.json().catch(() => ({}));
           throw new Error(`初始化空仓库失败: ${formatApiError(errData, initRes.statusText)}`);
         }
 
-        // Refetch HEAD ref
         try {
           const newRefRes = await robustFetch(refUrl, { headers }, 2, 10000);
           if (newRefRes.ok) {
@@ -844,81 +1279,165 @@ jobs:
             addLog(`空仓库自动初始化成功！已获得基准 Commit: ${parentCommitSha?.substring(0, 7)}`, 'success');
           }
         } catch {
-          // ignore if new ref will be created in step 5
+          // ignore
+        }
+      }
+
+      setUploadProgress(12);
+
+      // Fetch remote tree SHA map for zero-upload deduplication when parent commit exists
+      const remoteTreeShaMap = new Map<string, string>();
+      if (parentCommitSha) {
+        try {
+          setCurrentStepText('正在比对远端文件指纹以跳过未变动文件...');
+          const remoteTreeRes = await robustFetch(
+            `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/trees/${parentCommitSha}?recursive=1`,
+            { headers },
+            2,
+            12000
+          );
+          if (remoteTreeRes.ok) {
+            const remoteTreeData = await remoteTreeRes.json();
+            if (Array.isArray(remoteTreeData?.tree)) {
+              for (const node of remoteTreeData.tree) {
+                if (node.type === 'blob' && node.path && node.sha) {
+                  remoteTreeShaMap.set(node.path, node.sha);
+                }
+              }
+            }
+          }
+        } catch {
+          // Non-fatal: continue without remote tree diff
         }
       }
 
       setUploadProgress(15);
 
-      // 2. Upload Blobs with Resumable Caching & Anti-Throttling Pacing
-      setCurrentStepText(`正在依次构建并上传 ${extractedFiles.length} 个文件数据 (支持断点续传与智能重试)...`);
-      
-      const uploadAllBlobs = async (useCache = true) => {
-        const items: { path: string; mode: string; type: string; sha: string }[] = [];
-        let hits = 0;
+      // Build upload target list with optional subdirectory prefix
+      const uploadTargets = extractedFiles
+        .map((file) => {
+          const relativeNormalized = sanitizeGitPath(file.path);
+          if (!relativeNormalized) return null;
+          const fullRepoPath = cleanSubdir ? `${cleanSubdir}/${relativeNormalized}` : relativeNormalized;
+          return { file, fullRepoPath };
+        })
+        .filter((x): x is { file: ExtractedFile; fullRepoPath: string } => x !== null);
 
-        for (let i = 0; i < extractedFiles.length; i++) {
-          const file = extractedFiles[i];
-          const normalizedPath = sanitizeGitPath(file.path);
-          if (!normalizedPath) continue;
+      const uploadAllBlobs = async (useCacheAndRemoteDiff = true) => {
+        const items: ({ path: string; mode: string; type: string; sha: string } | null)[] = new Array(
+          uploadTargets.length
+        ).fill(null);
 
-          const cacheKey = `${cleanUsername}/${cleanRepo}:${normalizedPath}_${file.size}`;
-          let blobSha = useCache ? blobShaCacheRef.current.get(cacheKey) : undefined;
+        let completedCount = 0;
+        let cacheOrRemoteHits = 0;
+        let maxActiveWorkers = 5;
+        let throttledFlag = false;
 
-          if (blobSha) {
-            hits++;
-            items.push({
-              path: normalizedPath,
-              mode: '100644',
-              type: 'blob',
-              sha: blobSha
-            });
-          } else {
-            // Small pacing delay to prevent triggering GitHub secondary rate limits
-            if (i > 0) {
-              await new Promise(r => setTimeout(r, 45));
-            }
-
-            const base64Content = uint8ToBase64(file.content);
-            const blobUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/blobs`;
-            
-            const blobRes = await robustFetch(blobUrl, {
-              method: 'POST',
-              headers,
-              body: JSON.stringify({
-                content: base64Content,
-                encoding: 'base64'
-              })
-            }, 4, 30000);
-
-            if (!blobRes.ok) {
-              const errData = await blobRes.json().catch(() => ({}));
-              throw new Error(`文件 [${normalizedPath}] 上传失败 (${blobRes.status}): ${formatApiError(errData, blobRes.statusText)}`);
-            }
-
-            const blobData = await blobRes.json();
-            blobSha = blobData.sha;
-            blobShaCacheRef.current.set(cacheKey, blobSha);
-
-            items.push({
-              path: normalizedPath,
-              mode: '100644',
-              type: 'blob',
-              sha: blobSha
-            });
+        const onRateLimitHit = () => {
+          if (!throttledFlag) {
+            throttledFlag = true;
+            maxActiveWorkers = 2;
           }
+        };
 
-          const progressPercent = Math.floor(15 + ((i + 1) / extractedFiles.length) * 60);
-          setUploadProgress(progressPercent);
-          setCurrentStepText(`上传进度 (${i + 1}/${extractedFiles.length}): ${normalizedPath}`);
-        }
+        let nextIndex = 0;
 
-        if (hits > 0) {
-          addLog(`已完成全部 ${extractedFiles.length} 个文件构建 (⚡ 成功复用 ${hits} 个断点缓存文件)`, 'success');
+        const worker = async () => {
+          while (true) {
+            // Dynamic concurrency throttling check
+            const myIndex = nextIndex++;
+            if (myIndex >= uploadTargets.length) break;
+
+            const { file, fullRepoPath } = uploadTargets[myIndex];
+            const cacheKey = `${cleanUsername}/${cleanRepo}:${fullRepoPath}_${file.size}`;
+            let blobSha: string | undefined = useCacheAndRemoteDiff
+              ? blobShaCacheRef.current.get(cacheKey)
+              : undefined;
+
+            // Lossless SHA-1 comparison against remote repository blob SHA
+            if (!blobSha && useCacheAndRemoteDiff && remoteTreeShaMap.has(fullRepoPath)) {
+              try {
+                const localGitSha = await computeGitBlobSha(file.content);
+                if (remoteTreeShaMap.get(fullRepoPath) === localGitSha) {
+                  blobSha = localGitSha;
+                  blobShaCacheRef.current.set(cacheKey, blobSha);
+                }
+              } catch {
+                // fallback to uploading if crypto.subtle unavailable
+              }
+            }
+
+            if (blobSha) {
+              cacheOrRemoteHits++;
+            } else {
+              // Slight pacing if throttled
+              if (throttledFlag) {
+                await new Promise((r) => setTimeout(r, 150));
+              }
+
+              const base64Content = await uint8ToBase64Fast(file.content);
+              const blobUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/blobs`;
+
+              const blobRes = await robustFetch(
+                blobUrl,
+                {
+                  method: 'POST',
+                  headers,
+                  body: JSON.stringify({
+                    content: base64Content,
+                    encoding: 'base64'
+                  })
+                },
+                4,
+                30000,
+                onRateLimitHit
+              );
+
+              if (!blobRes.ok) {
+                const errData = await blobRes.json().catch(() => ({}));
+                throw new Error(
+                  `文件 [${fullRepoPath}] 上传失败 (${blobRes.status}): ${formatApiError(errData, blobRes.statusText)}`
+                );
+              }
+
+              const blobData = await blobRes.json();
+              blobSha = blobData.sha as string;
+              blobShaCacheRef.current.set(cacheKey, blobSha);
+            }
+
+            items[myIndex] = {
+              path: fullRepoPath,
+              mode: '100644',
+              type: 'blob',
+              sha: blobSha
+            };
+
+            completedCount++;
+            const progressPercent = Math.floor(15 + (completedCount / uploadTargets.length) * 60);
+            setUploadProgress(progressPercent);
+            setCurrentStepText(`并发同步进度 (${completedCount}/${uploadTargets.length}): ${fullRepoPath}`);
+          }
+        };
+
+        setCurrentStepText(`正在以受控并发队列处理 ${uploadTargets.length} 个文件...`);
+        const initialWorkers = Array.from({ length: Math.min(maxActiveWorkers, uploadTargets.length) }, () => worker());
+        await Promise.all(initialWorkers);
+
+        const validItems = items.filter(
+          (item): item is { path: string; mode: string; type: string; sha: string } => item !== null
+        );
+
+        if (cacheOrRemoteHits > 0) {
+          addLog(
+            `已完成全部 ${uploadTargets.length} 个文件处理 (零流量跳过未修改/缓存文件 ${cacheOrRemoteHits} 个，实际上传 ${
+              uploadTargets.length - cacheOrRemoteHits
+            } 个)`,
+            'success'
+          );
         } else {
-          addLog(`已完成全部 ${extractedFiles.length} 个文件的 Git Blob 构建`, 'success');
+          addLog(`已完成全部 ${uploadTargets.length} 个文件的并发 Git Blob 构建`, 'success');
         }
-        return items;
+        return validItems;
       };
 
       let treeItems = await uploadAllBlobs(true);
@@ -927,36 +1446,44 @@ jobs:
       // 3. Create Git Tree
       setCurrentStepText('正在生成 Git Tree 目录对象...');
       const treeUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/trees`;
-      
-      let treeBody: any = { tree: treeItems };
-      if (!forcePush && parentCommitSha) {
+
+      // In subfolder deploy mode, preserve base_tree so files outside targetSubdir aren't deleted!
+      const useBaseTree = Boolean(cleanSubdir) || (!forcePush && Boolean(parentCommitSha));
+      const treeBody: any = { tree: treeItems };
+      if (useBaseTree && parentCommitSha) {
         treeBody.base_tree = parentCommitSha;
       }
 
-      let treeRes = await robustFetch(treeUrl, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(treeBody)
-      }, 3);
+      let treeRes = await robustFetch(
+        treeUrl,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(treeBody)
+        },
+        3
+      );
 
-      // Self-healing: If GitHub returns 'is not a valid blob', wipe invalid cache and retry freshly once
       if (!treeRes.ok) {
         const errData = await treeRes.json().catch(() => ({}));
         const errDetail = formatApiError(errData, treeRes.statusText);
 
         if (errDetail.includes('is not a valid blob') || errDetail.includes('invalid blob')) {
-          addLog(`⚠️ 检测到部分缓存 Blob 节点在目标仓库中失效，正在自动清除无效缓存并全量重新传输...`, 'info');
+          addLog('检测到部分缓存 Blob 节点失效，正在自动清除无效缓存并全量重新传输...', 'info');
           blobShaCacheRef.current.clear();
-          
-          // Re-upload all blobs with forced cache bypass
+
           treeItems = await uploadAllBlobs(false);
           treeBody.tree = treeItems;
 
-          treeRes = await robustFetch(treeUrl, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify(treeBody)
-          }, 3);
+          treeRes = await robustFetch(
+            treeUrl,
+            {
+              method: 'POST',
+              headers,
+              body: JSON.stringify(treeBody)
+            },
+            3
+          );
         }
 
         if (!treeRes.ok) {
@@ -972,10 +1499,9 @@ jobs:
       // 4. Create Commit
       setCurrentStepText('正在生成 Commit 提交对象...');
       const commitUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/commits`;
-      
-      const cleanEmail = (email && email.trim().includes('@'))
-        ? email.trim()
-        : `${cleanUsername}@users.noreply.github.com`;
+
+      const cleanEmail =
+        email && email.trim().includes('@') ? email.trim() : `${cleanUsername}@users.noreply.github.com`;
       const cleanName = cleanUsername || 'ZipDeploy User';
 
       const commitBody: any = {
@@ -989,30 +1515,41 @@ jobs:
         }
       };
 
-      let commitRes = await robustFetch(commitUrl, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(commitBody)
-      }, 3);
-
-      // Fail-safe auto-retry if 422 Validation Failed occurs
-      if (!commitRes.ok && commitRes.status === 422) {
-        addLog('⚠️ 提交触发 GitHub 422 校验，正在自动重试 (省略自定义 Author)...', 'info');
-        delete commitBody.author;
-        commitRes = await robustFetch(commitUrl, {
+      let commitRes = await robustFetch(
+        commitUrl,
+        {
           method: 'POST',
           headers,
           body: JSON.stringify(commitBody)
-        }, 2);
+        },
+        3
+      );
 
-        if (!commitRes.ok && commitRes.status === 422 && commitBody.parents && commitBody.parents.length > 0) {
-          addLog('⚠️ 尝试切换为独立 Root Commit 节点重试...', 'info');
-          commitBody.parents = [];
-          commitRes = await robustFetch(commitUrl, {
+      if (!commitRes.ok && commitRes.status === 422) {
+        addLog('提交触发 GitHub 422 校验，正在自动重试 (省略自定义 Author)...', 'info');
+        delete commitBody.author;
+        commitRes = await robustFetch(
+          commitUrl,
+          {
             method: 'POST',
             headers,
             body: JSON.stringify(commitBody)
-          }, 2);
+          },
+          2
+        );
+
+        if (!commitRes.ok && commitRes.status === 422 && commitBody.parents && commitBody.parents.length > 0) {
+          addLog('尝试切换为独立 Root Commit 节点重试...', 'info');
+          commitBody.parents = [];
+          commitRes = await robustFetch(
+            commitUrl,
+            {
+              method: 'POST',
+              headers,
+              body: JSON.stringify(commitBody)
+            },
+            2
+          );
         }
       }
 
@@ -1028,26 +1565,34 @@ jobs:
       // 5. Update Branch Ref
       setCurrentStepText(`正在将 ${cleanBranch} 分支更新指向至新提交...`);
       const updateRefUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/refs/heads/${cleanBranch}`;
-      const updateRefRes = await robustFetch(updateRefUrl, {
-        method: 'PATCH',
-        headers,
-        body: JSON.stringify({
-          sha: commitData.sha,
-          force: forcePush
-        })
-      }, 3);
+      const updateRefRes = await robustFetch(
+        updateRefUrl,
+        {
+          method: 'PATCH',
+          headers,
+          body: JSON.stringify({
+            sha: commitData.sha,
+            force: forcePush
+          })
+        },
+        3
+      );
 
       if (!updateRefRes.ok) {
         if (updateRefRes.status === 404 || updateRefRes.status === 409 || updateRefRes.status === 422) {
           const createRefUrl = `https://api.github.com/repos/${cleanUsername}/${cleanRepo}/git/refs`;
-          const createRefRes = await robustFetch(createRefUrl, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-              ref: `refs/heads/${cleanBranch}`,
-              sha: commitData.sha
-            })
-          }, 3);
+          const createRefRes = await robustFetch(
+            createRefUrl,
+            {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({
+                ref: `refs/heads/${cleanBranch}`,
+                sha: commitData.sha
+              })
+            },
+            3
+          );
           if (!createRefRes.ok) {
             const errData = await createRefRes.json().catch(() => ({}));
             throw new Error(`创建新分支 ${cleanBranch} 失败: ${formatApiError(errData, createRefRes.statusText)}`);
@@ -1061,16 +1606,14 @@ jobs:
       setUploadProgress(100);
       setIsUploading(false);
       setUploadSuccess(true);
-      addLog(`🎉 部署成功！远端 GitHub 仓库文件已被彻底覆写更新！`, 'success');
+      addLog('部署成功！远端 GitHub 仓库文件已更新。', 'success');
 
-      // Attempt automatic Pages setup and Action dispatch via API
       triggerPagesAutoSetup();
-
     } catch (err: any) {
       console.error(err);
       setIsUploading(false);
-      
-      let rawError = err.message || '网络连接中断或 API 授权失效';
+
+      const rawError = err.message || '网络连接中断或 API 授权失效';
       const diag = analyzeError(rawError, cleanUsername, cleanRepo, cleanBranch);
 
       if (diag.code === 'ERR_CACHE_BLOB_EXPIRED') {
@@ -1079,7 +1622,7 @@ jobs:
 
       setErrorDiagnostics(diag);
       setUploadError(diag.reason);
-      addLog(`❌ 部署中断 [${diag.code}]: ${diag.title} - ${diag.reason}`, 'error');
+      addLog(`部署中断 [${diag.code}]: ${diag.title} - ${diag.reason}`, 'error');
     }
   };
 
@@ -1089,1196 +1632,228 @@ jobs:
     setTimeout(() => setCopiedKey(null), 2000);
   };
 
-  const filteredFiles = extractedFiles.filter(f => 
-    f.path.toLowerCase().includes(fileSearch.toLowerCase())
-  );
-
-  const actionYamlContent = `# .github/workflows/unzip-and-deploy.yml
-# GitHub Actions 自动化解压与覆盖上传工作流
-
-name: Auto Unzip and Deploy
-
-on:
-  push:
-    paths: ['**.zip']
-  workflow_dispatch:
-
-jobs:
-  unzip-and-commit:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: 📥 检出仓库分支
-        uses: actions/checkout@v4
-        with:
-          token: \${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
-
-      - name: 📦 查找并解压 ZIP 压缩包
-        run: |
-          ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" | head -n 1)
-          if [ -z "$ZIP_FILE" ]; then
-            echo "未找到 ZIP 压缩包文件"
-            exit 1
-          fi
-          echo "找到压缩包: $ZIP_FILE"
-
-          mkdir -p temp_extracted
-          unzip -q -o "$ZIP_FILE" -d temp_extracted
-          rm "$ZIP_FILE"
-
-          if [ $(ls -1 temp_extracted | wc -l) -eq 1 ] && [ -d temp_extracted/* ]; then
-            echo "提取嵌套子文件夹层级..."
-            cp -r temp_extracted/*/* . 2>/dev/null || true
-            cp -r temp_extracted/*/.?* . 2>/dev/null || true
-          else
-            cp -r temp_extracted/* . 2>/dev/null || true
-            cp -r temp_extracted/.?* . 2>/dev/null || true
-          fi
-          rm -rf temp_extracted
-
-      - name: 🚀 提交并更新仓库全量文件
-        run: |
-          git config user.name "${username}"
-          git config user.email "${email}"
-          git add -A
-          if git diff --staged --quiet; then
-            echo "无需更新的变动"
-          else
-            git commit -m "refactor: auto unzip and replace workspace contents"
-            git push origin ${branch}
-          fi`;
-
-  const deployShContent = `#!/bin/bash
-# Termux 本地一键解压强推覆写仓库 + API 自动开启 Pages 脚本
-
-USERNAME="${username}"
-REPO="${repo}"
-EMAIL="${email}"
-BRANCH="${branch}"
-TOKEN="\${1:-${token || 'YOUR_GITHUB_TOKEN'}}";
-ZIP_PATH="\${2:-/sdcard/project.zip}"
-
-WORK_DIR="/sdcard/termux_zip_deploy_temp"
-rm -rf "$WORK_DIR" && mkdir -p "$WORK_DIR"
-
-echo "📦 正在解压 $ZIP_PATH 到临时工作区..."
-unzip -q -o "$ZIP_PATH" -d "$WORK_DIR"
-cd "$WORK_DIR" || exit 1
-
-ITEM_COUNT=$(ls -1 | wc -l)
-if [ "$ITEM_COUNT" -eq 1 ] && [ -d * ]; then
-    cd * || exit 1
-fi
-
-echo "⚙️ 初始化 Git 并重置提交历史..."
-rm -rf .git && git init
-git config user.name "$USERNAME"
-git config user.email "$EMAIL"
-git add .
-git commit -m "Upload unzipped files from $ZIP_PATH"
-git branch -M "$BRANCH"
-
-git remote add origin "https://\${TOKEN}@github.com/\${USERNAME}/\${REPO}.git"
-echo "⬆️ 强制推送到 GitHub 远端..."
-git push -u origin "$BRANCH" --force
-rm -rf "$WORK_DIR"
-
-echo "🌐 正在通过 API 全自动开启 GitHub Pages (Actions 模式)..."
-curl -s -X POST -H "Authorization: Bearer \${TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/\${USERNAME}/\${REPO}/pages" -d '{"build_type":"workflow"}' > /dev/null || true
-curl -s -X PUT -H "Authorization: Bearer \${TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/\${USERNAME}/\${REPO}/pages" -d '{"build_type":"workflow"}' > /dev/null || true
-
-echo "🚀 正在通过 API 自动触发 GitHub Actions 云端构建打包..."
-curl -s -X POST -H "Authorization: Bearer \${TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/\${USERNAME}/\${REPO}/actions/workflows/deploy-pages.yml/dispatches" -d "{\"ref\":\"\${BRANCH}\"}" > /dev/null || true
-
-echo "🎉 全套自动化处理完毕！大约 1 分钟后即可访问你的在线网站："
-echo "https://\${USERNAME}.github.io/\${REPO}/"`;
-
-  const termuxOneLiner = `pkg install -y curl && curl -s -X POST -H "Authorization: Bearer ${token || 'YOUR_TOKEN'}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${username}/${repo}/pages" -d '{"build_type":"workflow"}' && curl -s -X PUT -H "Authorization: Bearer ${token || 'YOUR_TOKEN'}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${username}/${repo}/pages" -d '{"build_type":"workflow"}' && curl -s -X POST -H "Authorization: Bearer ${token || 'YOUR_TOKEN'}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${username}/${repo}/actions/workflows/deploy-pages.yml/dispatches" -d '{"ref":"${branch}"}' && echo "🎉 Termux 已成功为你自动开启 GitHub Pages 并触发打包上线！"`;
+  const hasConfiguredRepo =
+    username !== 'your-username' && repo !== 'your-repository' && username.trim() && repo.trim();
 
   return (
-    <div className="min-h-screen bg-[#f7f7f6] text-[#1c1c1c] font-sans antialiased selection:bg-neutral-200">
-      
-      {/* Top Navbar */}
-      <header className="border-b border-neutral-200/80 bg-white/80 backdrop-blur-md sticky top-0 z-50">
-        <div className="max-w-4xl mx-auto px-5 py-3.5 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-full bg-black text-white flex items-center justify-center font-bold text-xs shadow-sm">
-              <FileArchive className="w-4 h-4 text-white" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="text-sm font-bold text-neutral-900 tracking-tight">
-                  zipdeploy
-                </h1>
-                <span className="text-[10px] font-mono font-medium text-neutral-500 bg-neutral-100 px-2 py-0.5 rounded-full border border-neutral-200">
-                  Monochrome Edition
-                </span>
-                <button
-                  type="button"
-                  onClick={handleForceUpdateSite}
-                  disabled={isRefreshingSite}
-                  className="p-1 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition active:scale-90 flex items-center justify-center"
-                  title="强制刷新页面并清除浏览器缓存"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingSite ? 'animate-spin text-neutral-900' : ''}`} />
-                </button>
-              </div>
+    <div className="min-h-screen flex bg-[#F8F8F7] dark:bg-[#0B0B0C] text-[#141413] dark:text-[#F4F4F5] transition-colors duration-150">
+      {/* Left Navigation Sidebar */}
+      <Sidebar
+        activeView={activeView}
+        onSelectView={setActiveView}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+        isRefreshingSite={isRefreshingSite}
+        onForceUpdateSite={handleForceUpdateSite}
+        onOpenSecurityNotice={() => setWelcomeModalOpen(true)}
+        mobileOpen={mobileNavOpen}
+        onCloseMobile={() => setMobileNavOpen(false)}
+      />
+
+      {/* Right Main Area */}
+      <div className="flex-1 min-w-0 flex flex-col">
+        {/* Top Contextual Header */}
+        <header className="h-16 px-4 sm:px-6 lg:px-8 border-b border-neutral-200/80 dark:border-neutral-800 bg-[#FFFFFF]/85 dark:bg-[#111113]/85 backdrop-blur-md sticky top-0 z-20 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3 min-w-0">
+            <button
+              type="button"
+              onClick={() => setMobileNavOpen(true)}
+              className="lg:hidden p-2 -ml-1.5 rounded-lg text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
+              aria-label="打开导航菜单"
+            >
+              <Menu className="w-4 h-4" />
+            </button>
+
+            <div className="flex items-center gap-2 text-xs min-w-0">
+              <span className="font-medium text-neutral-400 dark:text-neutral-500 whitespace-nowrap hidden sm:inline">
+                zipdeploy
+              </span>
+              <span className="text-neutral-300 dark:text-neutral-700 hidden sm:inline" aria-hidden="true">
+                /
+              </span>
+              <h1 className="font-semibold text-neutral-900 dark:text-neutral-100 truncate">
+                {VIEW_TITLES[activeView]}
+              </h1>
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2.5 shrink-0">
             <button
-              onClick={() => setShowGuide(!showGuide)}
-              className="inline-flex items-center gap-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 px-3.5 py-1.5 rounded-full transition"
+              type="button"
+              onClick={toggleTheme}
+              className="lg:hidden p-2 rounded-lg text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
+              aria-label="切换明暗主题"
             >
-              <HelpCircle className="w-3.5 h-3.5 text-neutral-800" />
-              <span>小白教程</span>
-              {showGuide ? <ChevronUp className="w-3 h-3 text-neutral-400" /> : <ChevronDown className="w-3 h-3 text-neutral-400" />}
+              {theme === 'dark' ? <Moon className="w-4 h-4" /> : <Sun className="w-4 h-4" />}
             </button>
 
-            {username !== 'your-username' && repo !== 'your-repository' && (
+            <button
+              type="button"
+              onClick={() => openQuickDrawer('guide')}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-neutral-700 dark:text-neutral-200 bg-neutral-100 dark:bg-neutral-800/80 hover:bg-neutral-200/70 dark:hover:bg-neutral-800 transition-colors whitespace-nowrap shrink-0"
+            >
+              <BookOpen className="w-3.5 h-3.5" />
+              <span>速查抽屉</span>
+            </button>
+
+            {hasConfiguredRepo && (
               <a
                 href={`https://github.com/${username}/${repo}`}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="inline-flex items-center gap-1 text-xs font-medium text-white bg-black hover:bg-neutral-800 px-3.5 py-1.5 rounded-full transition shadow-sm"
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-medium bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 hover:opacity-90 transition-opacity whitespace-nowrap shrink-0"
               >
                 <Github className="w-3.5 h-3.5" />
                 <span>目标仓库</span>
-                <ArrowUpRight className="w-3 h-3 opacity-60" />
+                <ArrowUpRight className="w-3 h-3 opacity-70" />
               </a>
             )}
           </div>
-        </div>
-      </header>
+        </header>
 
-      {/* Main Area */}
-      <main className="max-w-4xl mx-auto px-4 sm:px-6 py-8 space-y-6">
-
-        {/* Collapsible Beginner Guide Box */}
-        {showGuide && (
-          <div className="bg-white rounded-[28px] border border-neutral-200/80 p-6 shadow-[0_4px_20px_rgb(0,0,0,0.03)] space-y-5">
-            <div className="flex items-center justify-between border-b border-neutral-100 pb-3">
-              <div className="flex items-center gap-2">
-                <span className="w-6 h-6 rounded-full bg-neutral-100 flex items-center justify-center text-xs font-bold text-neutral-800">
-                  💡
-                </span>
-                <h2 className="text-sm font-bold text-neutral-900 tracking-tight">
-                  零基础小白 3 分钟极速上手教程
-                </h2>
-              </div>
-              <button 
-                onClick={() => setShowGuide(false)}
-                className="text-xs text-neutral-400 hover:text-neutral-700"
-              >
-                收起教程
-              </button>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              {/* Step 1 */}
-              <div className="bg-[#f9f9f8] border border-neutral-200/60 rounded-2xl p-4 space-y-2 relative">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2 text-xs font-bold text-neutral-900">
-                    <span className="w-5 h-5 rounded-full bg-black text-white flex items-center justify-center text-[10px] shrink-0">1</span>
-                    获取 GitHub Token (密钥)
-                  </div>
-                </div>
-                <p className="text-xs text-neutral-500 leading-relaxed">
-                  打开 GitHub -&gt; Settings -&gt; Developer Settings -&gt; Personal Access Tokens (classic) -&gt; 新建 Token，务必勾选 <code className="bg-white px-1 py-0.5 border rounded text-neutral-800 font-mono">repo</code> 选项，生成的字符串就是 Token。
-                </p>
-                <a
-                  href="https://github.com/settings/tokens/new?scopes=repo&description=ZipDeploy"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1 text-[11px] font-medium text-neutral-800 hover:underline pt-1"
-                >
-                  直接前往 GitHub 创建 Token <ArrowUpRight className="w-3 h-3" />
-                </a>
-              </div>
-
-              {/* Step 2 */}
-              <div className="bg-[#f9f9f8] border border-neutral-200/60 rounded-2xl p-4 space-y-2">
-                <div className="flex items-center gap-2 text-xs font-bold text-neutral-900">
-                  <span className="w-5 h-5 rounded-full bg-black text-white flex items-center justify-center text-[10px] shrink-0">2</span>
-                  填入账号与目标仓库
-                </div>
-                <p className="text-xs text-neutral-500 leading-relaxed">
-                  在下方设置区域填入 Token、你的 GitHub 用户名以及要覆盖的目标仓库名字。勾选“强制清空重置”会自动把以前传错的各种杂乱文件清理干净！
-                </p>
-              </div>
-
-              {/* Step 3 */}
-              <div className="bg-[#f9f9f8] border border-neutral-200/60 rounded-2xl p-4 space-y-2">
-                <div className="flex items-center gap-2 text-xs font-bold text-neutral-900">
-                  <span className="w-5 h-5 rounded-full bg-black text-white flex items-center justify-center text-[10px] shrink-0">3</span>
-                  拖入 ZIP 一键覆盖上传
-                </div>
-                <p className="text-xs text-neutral-500 leading-relaxed">
-                  将电脑或手机里的 <code className="bg-white px-1 py-0.5 border rounded text-neutral-800 font-mono">.zip</code> 文件拖入下方上传区，网页会在内存中秒速解压并直接发布覆盖 GitHub 仓库！
-                </p>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Configuration Card */}
-        <section className="bg-white rounded-[28px] border border-neutral-200/80 p-6 shadow-[0_8px_30px_rgb(0,0,0,0.03)] space-y-5">
-          <div className="flex items-center justify-between border-b border-neutral-100 pb-3">
-            <h2 className="text-xs font-bold uppercase tracking-wider text-neutral-400 flex items-center gap-2">
-              <Code2 className="w-4 h-4 text-neutral-800" /> 仓库参数配置
-            </h2>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={handleClearSaved}
-                className="text-[11px] text-neutral-400 hover:text-rose-600 flex items-center gap-1 transition"
-                title="清空已保存的表单配置"
-              >
-                <Trash2 className="w-3 h-3" />
-                <span>重置表单</span>
-              </button>
-              <span className="text-[11px] font-mono text-neutral-400 bg-neutral-100 px-2.5 py-0.5 rounded-full flex items-center gap-1">
-                <ShieldCheck className="w-3 h-3 text-emerald-600" /> REST API Direct Mode
-              </span>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs md:text-sm">
-            {/* Token */}
-            <div className="md:col-span-2 space-y-1.5">
-              <div className="flex items-center justify-between">
-                <label className="font-semibold text-neutral-700 flex items-center gap-1.5 text-xs">
-                  <Key className="w-3.5 h-3.5 text-neutral-800" /> GitHub Personal Access Token (PAT)
-                </label>
-                <button
-                  type="button"
-                  onClick={() => setShowToken(!showToken)}
-                  className="text-[11px] text-neutral-400 hover:text-neutral-700 flex items-center gap-1 transition"
-                >
-                  {showToken ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
-                  <span>{showToken ? '隐藏' : '显示'}</span>
-                </button>
-              </div>
-
-              <input
-                type={showToken ? "text" : "password"}
-                value={token}
-                onChange={(e) => setToken(e.target.value)}
-                placeholder="在此粘贴 ghp_xxxxxxxxxxxxxxxxxxxx"
-                className="w-full bg-[#f4f4f3] border border-neutral-200 focus:border-neutral-900 focus:bg-white rounded-2xl px-4 py-2.5 text-neutral-900 font-mono text-xs focus:outline-none transition"
-              />
-            </div>
-
-            {/* Commit message */}
-            <div className="space-y-1.5">
-              <label className="font-semibold text-neutral-700 flex items-center gap-1.5 text-xs">
-                <FileText className="w-3.5 h-3.5 text-neutral-800" /> Commit 提交描述
-              </label>
-              <input
-                type="text"
-                value={commitMessage}
-                onChange={(e) => setCommitMessage(e.target.value)}
-                placeholder="提交信息"
-                className="w-full bg-[#f4f4f3] border border-neutral-200 focus:border-neutral-900 focus:bg-white rounded-2xl px-4 py-2.5 text-neutral-900 text-xs focus:outline-none transition"
-              />
-            </div>
-
-            {/* Username */}
-            <div className="space-y-1.5">
-              <label className="font-semibold text-neutral-700 flex items-center gap-1.5 text-xs">
-                <User className="w-3.5 h-3.5 text-neutral-800" /> GitHub 用户名
-              </label>
-              <input
-                type="text"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="your-username"
-                className="w-full bg-[#f4f4f3] border border-neutral-200 focus:border-neutral-900 focus:bg-white rounded-2xl px-4 py-2.5 text-neutral-900 font-mono text-xs focus:outline-none transition"
-              />
-            </div>
-
-            {/* Repo */}
-            <div className="space-y-1.5">
-              <label className="font-semibold text-neutral-700 flex items-center gap-1.5 text-xs">
-                <Github className="w-3.5 h-3.5 text-neutral-800" /> 仓库名 (Repo)
-              </label>
-              <input
-                type="text"
-                value={repo}
-                onChange={(e) => setRepo(e.target.value)}
-                placeholder="your-repository"
-                className="w-full bg-[#f4f4f3] border border-neutral-200 focus:border-neutral-900 focus:bg-white rounded-2xl px-4 py-2.5 text-neutral-900 font-mono text-xs focus:outline-none transition"
-              />
-            </div>
-
-            {/* Email & Branch */}
-            <div className="grid grid-cols-2 gap-2">
-              <div className="space-y-1.5">
-                <label className="font-semibold text-neutral-700 flex items-center gap-1 text-xs">
-                  <Mail className="w-3.5 h-3.5 text-neutral-800" /> 邮箱
-                </label>
-                <input
-                  type="text"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="user@example.com"
-                  className="w-full bg-[#f4f4f3] border border-neutral-200 focus:border-neutral-900 focus:bg-white rounded-2xl px-3.5 py-2.5 text-neutral-900 font-mono text-xs focus:outline-none transition"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="font-semibold text-neutral-700 flex items-center gap-1 text-xs">
-                  <GitBranch className="w-3.5 h-3.5 text-neutral-800" /> 分支
-                </label>
-                <input
-                  type="text"
-                  value={branch}
-                  onChange={(e) => setBranch(e.target.value)}
-                  placeholder="main"
-                  className="w-full bg-[#f4f4f3] border border-neutral-200 focus:border-neutral-900 focus:bg-white rounded-2xl px-3.5 py-2.5 text-neutral-900 font-mono text-xs focus:outline-none transition"
-                />
-              </div>
-            </div>
-          </div>
-
-          <div className="pt-3 border-t border-neutral-100 flex flex-col sm:flex-row sm:items-center justify-between text-xs gap-3">
-            <div className="flex flex-wrap items-center gap-4">
-              <label className="flex items-center gap-2 cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={forcePush}
-                  onChange={(e) => setForcePush(e.target.checked)}
-                  className="w-4 h-4 accent-neutral-900 rounded border-neutral-300"
-                />
-                <span className="font-bold text-neutral-900">
-                  强制清空重置远端仓库 (--force overwrite)
-                </span>
-              </label>
-
-              <label className="flex items-center gap-2 cursor-pointer select-none text-neutral-800 font-medium">
-                <input
-                  type="checkbox"
-                  checked={autoInjectPagesAction}
-                  onChange={(e) => setAutoInjectPagesAction(e.target.checked)}
-                  className="w-4 h-4 accent-neutral-900 rounded border-neutral-300"
-                />
-                <span>自动注入 Pages 自动编译工作流 (.yml)</span>
-              </label>
-
-              <label className="flex items-center gap-1.5 cursor-pointer select-none text-neutral-500">
-                <input
-                  type="checkbox"
-                  checked={saveLocally}
-                  onChange={(e) => setSaveLocally(e.target.checked)}
-                  className="w-3.5 h-3.5 accent-neutral-900 rounded border-neutral-300"
-                />
-                <span className="text-[11px]">记住配置（仅保存在浏览器）</span>
-              </label>
-            </div>
-
-            <span className="text-neutral-400 text-[11px]">
-              {forcePush ? '彻底清洗远端历史多余文件，以解压代码为准' : '增量合并：保留已有旧文件'}
-            </span>
-          </div>
-        </section>
-
-        {/* Tab Selection */}
-        <div className="flex border-b border-neutral-200 gap-1 overflow-x-auto">
-          <button
-            onClick={() => setActiveTab('browser-upload')}
-            className={`flex items-center gap-2 px-6 py-3.5 font-semibold text-xs md:text-sm transition border-b-2 -mb-px shrink-0 rounded-t-2xl ${
-              activeTab === 'browser-upload'
-                ? 'border-neutral-900 text-neutral-900 bg-white'
-                : 'border-transparent text-neutral-500 hover:text-neutral-800'
-            }`}
-          >
-            <Upload className="w-4 h-4 text-neutral-800" /> 1. 网页直接解压上传
-          </button>
-
-          <button
-            onClick={() => setActiveTab('termux-script')}
-            className={`flex items-center gap-2 px-6 py-3.5 font-semibold text-xs md:text-sm transition border-b-2 -mb-px shrink-0 rounded-t-2xl ${
-              activeTab === 'termux-script'
-                ? 'border-neutral-900 text-neutral-900 bg-white'
-                : 'border-transparent text-neutral-500 hover:text-neutral-800'
-            }`}
-          >
-            <Terminal className="w-4 h-4 text-neutral-800" /> 2. Termux 脚本 (deploy.sh)
-          </button>
-
-          <button
-            onClick={() => setActiveTab('github-action')}
-            className={`flex items-center gap-2 px-6 py-3.5 font-semibold text-xs md:text-sm transition border-b-2 -mb-px shrink-0 rounded-t-2xl ${
-              activeTab === 'github-action'
-                ? 'border-neutral-900 text-neutral-900 bg-white'
-                : 'border-transparent text-neutral-500 hover:text-neutral-800'
-            }`}
-          >
-            <FileCode className="w-4 h-4 text-neutral-800" /> 3. GitHub Actions 工作流 (.yml)
-          </button>
-
-          <button
-            onClick={() => setActiveTab('faq')}
-            className={`flex items-center gap-2 px-6 py-3.5 font-semibold text-xs md:text-sm transition border-b-2 -mb-px shrink-0 rounded-t-2xl ${
-              activeTab === 'faq'
-                ? 'border-neutral-900 text-neutral-900 bg-white'
-                : 'border-transparent text-neutral-500 hover:text-neutral-800'
-            }`}
-          >
-            <ShieldAlert className="w-4 h-4 text-rose-600" /> 4. 报错与故障排查手册
-          </button>
-        </div>
-
-        {/* TAB 1: Direct Browser Unzip & API Upload */}
-        {activeTab === 'browser-upload' && (
-          <div className="space-y-6">
-            
-            {/* Drag & Drop File Select Box */}
-            <div
-              onDragOver={(e) => e.preventDefault()}
+        {/* Active View Viewport */}
+        <main className="flex-1 px-4 sm:px-6 lg:px-8 py-7 max-w-[1320px] w-full mx-auto">
+          {activeView === 'deploy' && (
+            <DeployWorkspace
+              token={token}
+              setToken={setToken}
+              showToken={showToken}
+              setShowToken={setShowToken}
+              username={username}
+              setUsername={setUsername}
+              repo={repo}
+              setRepo={setRepo}
+              email={email}
+              setEmail={setEmail}
+              branch={branch}
+              setBranch={setBranch}
+              targetSubdir={targetSubdir}
+              setTargetSubdir={setTargetSubdir}
+              commitMessage={commitMessage}
+              setCommitMessage={setCommitMessage}
+              forcePush={forcePush}
+              setForcePush={setForcePush}
+              autoInjectPagesAction={autoInjectPagesAction}
+              setAutoInjectPagesAction={setAutoInjectPagesAction}
+              saveLocally={saveLocally}
+              setSaveLocally={setSaveLocally}
+              onClearSaved={handleClearSaved}
+              profiles={profiles}
+              activeProfileId={activeProfileId}
+              onSelectProfile={handleSelectProfile}
+              onSaveProfile={handleSaveProfile}
+              onDeleteProfile={handleDeleteProfile}
+              isCheckingToken={isCheckingToken}
+              tokenCheckResult={tokenCheckResult}
+              onCheckToken={handleCheckToken}
+              onOpenRollback={handleOpenRollback}
+              onOpenCreateRepo={handleOpenCreateRepo}
+              fileInputRef={fileInputRef}
+              zipFile={zipFile}
+              extractedFiles={extractedFiles}
+              isUnzipping={isUnzipping}
+              unzipError={unzipError}
+              fileSearch={fileSearch}
+              setFileSearch={setFileSearch}
+              visibleFileCount={visibleFileCount}
+              setVisibleFileCount={setVisibleFileCount}
+              ignoreNodeModules={ignoreNodeModules}
+              filterStats={filterStats}
+              onFileChange={handleFileChange}
               onDrop={handleDrop}
-              onClick={() => fileInputRef.current?.click()}
-              className="border-2 border-dashed border-neutral-300 hover:border-neutral-900 rounded-[28px] p-8 md:p-12 text-center bg-white hover:bg-[#fafaf9] cursor-pointer transition duration-200 space-y-3 group shadow-[0_8px_30px_rgb(0,0,0,0.02)]"
-            >
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".zip"
-                onChange={handleFileChange}
-                className="hidden"
-              />
+              onGenerateSampleZip={handleGenerateSampleZip}
+              onToggleNodeModules={handleToggleNodeModules}
+              onPreviewFile={setPreviewFile}
+              isUploading={isUploading}
+              uploadProgress={uploadProgress}
+              currentStepText={currentStepText}
+              logs={logs}
+              uploadSuccess={uploadSuccess}
+              uploadError={uploadError}
+              errorDiagnostics={errorDiagnostics}
+              pagesStatus={pagesStatus}
+              isTriggeringPages={isTriggeringPages}
+              onUploadToGithub={handleInitiateUpload}
+              onTriggerPagesAutoSetup={triggerPagesAutoSetup}
+              latestActionRun={latestActionRun}
+              isPollingActions={isPollingActions}
+              onRefreshActionRun={fetchLatestActionRun}
+              onOpenQuickDrawer={openQuickDrawer}
+            />
+          )}
 
-              <div className="w-14 h-14 rounded-full bg-neutral-100 group-hover:bg-black group-hover:text-white flex items-center justify-center mx-auto text-neutral-800 transition duration-300 shadow-sm">
-                <FileArchive className="w-7 h-7" />
-              </div>
+          {activeView === 'guide' && <GuideView onNavigateView={setActiveView} />}
 
-              <div>
-                <h3 className="font-bold text-neutral-900 text-base">
-                  {zipFile ? zipFile.name : '点击或拖拽上传你的 .zip 格式压缩包'}
-                </h3>
-                <p className="text-xs text-neutral-400 mt-1">
-                  {zipFile 
-                    ? `压缩包体积: ${(zipFile.size / 1024).toFixed(1)} KB` 
-                    : '无需手机 Termux 终端，网页自动在浏览器解压并全量上传至 GitHub 目标仓库'}
-                </p>
-              </div>
+          {activeView === 'scripts' && (
+            <ScriptsView
+              username={username}
+              repo={repo}
+              email={email}
+              branch={branch}
+              token={token}
+              copiedKey={copiedKey}
+              onCopy={handleCopy}
+            />
+          )}
 
-              {/* Demo zip test button */}
-              {!zipFile && !isUnzipping && (
-                <div className="pt-2">
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleGenerateSampleZip();
-                    }}
-                    className="inline-flex items-center gap-1.5 text-xs text-neutral-600 hover:text-black bg-neutral-100 hover:bg-neutral-200 px-3.5 py-1.5 rounded-full font-medium transition"
-                  >
-                    <Play className="w-3 h-3 fill-neutral-700" />
-                    <span>无 ZIP？点击生成测试示范包 (Demo Sample)</span>
-                  </button>
-                </div>
-              )}
+          {activeView === 'faq' && <FaqView />}
+        </main>
+      </div>
 
-              {isUnzipping && (
-                <div className="inline-flex items-center gap-2 text-xs font-semibold text-neutral-700 bg-neutral-100 px-4 py-2 rounded-full">
-                  <RefreshCw className="w-3.5 h-3.5 animate-spin text-neutral-900" />
-                  <span>正在内存中解压分析 ZIP 结构...</span>
-                </div>
-              )}
-            </div>
+      {/* Slide-Over Quick Reference Drawer */}
+      <QuickDrawer
+        activeTab={quickDrawerTab}
+        onChangeTab={(tab) => setQuickDrawerTab(tab)}
+        onClose={() => setQuickDrawerTab(null)}
+        onNavigateFullView={setActiveView}
+        initialQuery={quickDrawerQuery}
+      />
 
-            {unzipError && (
-              <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4 flex items-center gap-3 text-xs text-rose-800">
-                <XCircle className="w-4 h-4 text-rose-600 shrink-0" />
-                <span>{unzipError}</span>
-              </div>
-            )}
+      {/* First-Visit Safety & Privacy Notice Modal */}
+      <WelcomeModal
+        open={welcomeModalOpen}
+        isFirstVisit={!hasAcceptedWelcome}
+        onAccept={handleAcceptWelcome}
+        onClose={() => setWelcomeModalOpen(false)}
+      />
 
-            {/* Extracted File Tree Preview */}
-            {extractedFiles.length > 0 && (
-              <div className="bg-white rounded-[28px] border border-neutral-200/80 p-6 md:p-8 space-y-5 shadow-[0_8px_30px_rgb(0,0,0,0.03)]">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-neutral-100 pb-4">
-                  <div>
-                    <h3 className="font-bold text-neutral-900 text-sm flex items-center gap-2">
-                      <FolderTree className="w-4 h-4 text-neutral-800" /> 已解析解压目录 ({extractedFiles.length} 个文件)
-                    </h3>
-                    <p className="text-xs text-neutral-400 mt-0.5">将以此结构全量提交覆盖至 GitHub 仓库</p>
-                  </div>
+      {/* Pre-Push Secret Detection Confirmation Modal */}
+      <SecurityWarningModal
+        findings={securityFindings}
+        onCancel={() => setSecurityFindings([])}
+        onConfirmProceed={executeUploadToGithub}
+      />
 
-                  <button
-                    onClick={handleUploadToGithub}
-                    disabled={isUploading}
-                    className={`inline-flex items-center justify-center gap-2 px-6 py-3 rounded-full text-xs font-bold transition shadow-sm ${
-                      isUploading 
-                        ? 'bg-neutral-200 text-neutral-500 cursor-not-allowed' 
-                        : 'bg-black hover:bg-neutral-800 text-white'
-                    }`}
-                  >
-                    {isUploading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
-                    {isUploading ? '正在同步至 GitHub...' : '确认解压并直接覆盖推送到 GitHub'}
-                  </button>
-                </div>
+      {/* Instant Extracted File Preview Modal */}
+      <FilePreviewModal file={previewFile} onClose={() => setPreviewFile(null)} />
 
-                {/* Filter Status & Options Banner */}
-                <div className="bg-neutral-50 border border-neutral-200/80 rounded-2xl p-4 text-xs space-y-2">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 text-neutral-800 font-medium">
-                      <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
-                      <span>
-                        全量保留你的代码文件与隐藏配置 (<code>.gitignore</code>, <code>.env</code>, <code>.github</code> 等)
-                      </span>
-                    </div>
+      {/* Commit History & Instant Rollback Modal */}
+      <RollbackModal
+        open={rollbackModalOpen}
+        onClose={() => setRollbackModalOpen(false)}
+        username={username}
+        repo={repo}
+        branch={branch}
+        commits={rollbackCommits}
+        isLoading={isLoadingCommits}
+        error={rollbackError}
+        isRollingBack={isRollingBack}
+        rollbackSuccessSha={rollbackSuccessSha}
+        onRefresh={fetchCommitHistory}
+        onRollbackToSha={handleRollbackToSha}
+      />
 
-                    {filterStats.nodeModulesCount > 0 && (
-                      <label className="inline-flex items-center gap-2 cursor-pointer bg-white px-3 py-1.5 rounded-xl border border-neutral-200 text-neutral-800 font-semibold hover:border-black transition">
-                        <input
-                          type="checkbox"
-                          checked={ignoreNodeModules}
-                          onChange={(e) => handleToggleNodeModules(e.target.checked)}
-                          className="rounded text-black focus:ring-black accent-black w-3.5 h-3.5"
-                        />
-                        <span>跳过 node_modules 依赖库 ({filterStats.nodeModulesCount} 个文件)</span>
-                      </label>
-                    )}
-                  </div>
-
-                  {(filterStats.junkCount > 0 || filterStats.nodeModulesCount > 0) && (
-                    <p className="text-[11px] text-neutral-500">
-                      💡 提示：
-                      {filterStats.junkCount > 0 && `已净化屏蔽 ${filterStats.junkCount} 个系统垃圾/元数据文件 (.DS_Store / __MACOSX / .git)`}
-                      {filterStats.junkCount > 0 && filterStats.nodeModulesCount > 0 && ignoreNodeModules && ' ； '}
-                      {filterStats.nodeModulesCount > 0 && ignoreNodeModules && `已跳过 ${filterStats.nodeModulesCount} 个 node_modules 依赖文件（取消勾选右侧开关可取消跳过）。`}
-                    </p>
-                  )}
-                </div>
-
-                {/* Progress Bar */}
-                {isUploading && (
-                  <div className="space-y-2 pt-1">
-                    <div className="flex justify-between text-xs font-mono text-neutral-600 font-medium">
-                      <span>{currentStepText}</span>
-                      <span>{uploadProgress}%</span>
-                    </div>
-                    <div className="w-full bg-neutral-100 h-2 rounded-full overflow-hidden border border-neutral-200">
-                      <div 
-                        className="bg-black h-full transition-all duration-300" 
-                        style={{ width: `${uploadProgress}%` }}
-                      />
-                    </div>
-                  </div>
-                )}
-
-                {/* Success Banner */}
-                {uploadSuccess && (
-                  <div className="space-y-4">
-                    <div className="bg-emerald-50 border border-emerald-200 text-emerald-900 p-4.5 rounded-2xl flex items-center justify-between text-xs">
-                      <div className="flex items-center gap-2 font-semibold">
-                        <CheckCircle2 className="w-4.5 h-4.5 text-emerald-600 shrink-0" />
-                        <span>代码已成功推送！远端 GitHub 仓库文件已被彻底覆写更新！</span>
-                      </div>
-                      <a
-                        href={`https://github.com/${username}/${repo}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="underline font-bold hover:text-emerald-950 flex items-center gap-1 shrink-0"
-                      >
-                        前往查看仓库 <ExternalLink className="w-3 h-3" />
-                      </a>
-                    </div>
-
-                    {/* Crucial Setup Box for GitHub Pages */}
-                    <div className="bg-amber-50/90 border border-amber-200 rounded-2xl p-5 text-xs text-amber-950 space-y-3 shadow-sm">
-                      <div className="flex items-center gap-2 font-bold text-amber-900 text-sm border-b border-amber-200/60 pb-2">
-                        <span className="w-6 h-6 rounded-full bg-amber-500 text-white flex items-center justify-center text-xs shrink-0">🚨</span>
-                        <span>新建仓库发不了网站？看这 2 个 GitHub 关键设置（解决没有 Save 键问题）</span>
-                      </div>
-                      <p className="leading-relaxed text-amber-900">
-                        提示：网页已为你自动注入了云端构建打包工作流 <code>.github/workflows/deploy-pages.yml</code>！如果你删除了旧仓库重新建了新仓库，必须在 GitHub 完成以下 2 项开启：
-                      </p>
-                      
-                      <div className="bg-white/90 border border-amber-200 rounded-xl p-3.5 space-y-3">
-                        <div className="space-y-1">
-                          <div className="font-bold text-amber-950 flex items-center gap-1.5">
-                            <span className="w-4.5 h-4.5 rounded-full bg-amber-900 text-white text-[10px] flex items-center justify-center font-mono">1</span>
-                            把 Source 切换为 GitHub Actions：
-                          </div>
-                          <div className="pl-6 text-amber-900 space-y-1">
-                            <p>前往：<a href={`https://github.com/${username}/${repo}/settings/pages`} target="_blank" rel="noopener noreferrer" className="underline font-mono font-bold text-amber-950">Settings -&gt; Pages</a></p>
-                            <p>找到 <strong>Build and deployment -&gt; Source</strong> 下拉菜单，切换为 <strong className="bg-amber-200/80 text-amber-950 px-1.5 py-0.5 rounded border border-amber-300 font-mono">GitHub Actions</strong>。</p>
-                            <p className="text-[11px] text-amber-800 bg-amber-100/60 p-1.5 rounded border border-amber-200">💡 <strong>找不到 Save 键？</strong> 别担心！切换为 GitHub Actions 选项的瞬间，GitHub 就已经<strong>自动保存生效</strong>了，因此下方不需要也不再有 Save 键！</p>
-                          </div>
-                        </div>
-
-                        <div className="border-t border-amber-100 pt-2.5 space-y-1">
-                          <div className="font-bold text-amber-950 flex items-center gap-1.5">
-                            <span className="w-4.5 h-4.5 rounded-full bg-amber-900 text-white text-[10px] flex items-center justify-center font-mono">2</span>
-                            开启 Actions 读写权限（防止部署报错 403）：
-                          </div>
-                          <div className="pl-6 text-amber-900 space-y-1">
-                            <p>前往：<a href={`https://github.com/${username}/${repo}/settings/actions`} target="_blank" rel="noopener noreferrer" className="underline font-mono font-bold text-amber-950">Settings -&gt; Actions -&gt; General</a></p>
-                            <p>滑到最底部 <strong>Workflow permissions</strong>，选中 <strong className="bg-amber-200/80 text-amber-950 px-1.5 py-0.5 rounded border border-amber-300">Read and write permissions</strong> 并点击底部的 <strong>Save</strong> 按钮！</p>
-                          </div>
-                        </div>
-
-                        <div className="border-t border-amber-100 pt-2.5 space-y-1">
-                          <div className="font-bold text-amber-950 flex items-center gap-1.5">
-                            <span className="w-4.5 h-4.5 rounded-full bg-amber-900 text-white text-[10px] flex items-center justify-center font-mono">3</span>
-                            触发云端编译打包：
-                          </div>
-                          <div className="pl-6 text-amber-900 space-y-1">
-                            <p>前往：<a href={`https://github.com/${username}/${repo}/actions`} target="_blank" rel="noopener noreferrer" className="underline font-mono font-bold text-amber-950">Actions 标签页</a>，点击 <i>Deploy site to GitHub Pages</i> &rarr; 点击右侧 <strong>Run workflow</strong> 运行。</p>
-                            <p className="text-emerald-800 font-semibold">约 1 分钟后绿灯亮起，点击下面的网址即可正常打开你的网页啦！</p>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="bg-amber-100/80 border border-amber-300 rounded-xl p-3 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
-                        <div>
-                          <div className="font-bold text-amber-950 flex items-center gap-1.5 text-xs">
-                            <Zap className="w-4 h-4 text-amber-700 fill-amber-500" />
-                            <span>懒得手动找按钮？一键全自动 API 触发：</span>
-                          </div>
-                          <p className="text-[11px] text-amber-900 mt-0.5">点击右侧按钮，工具将直接通过 GitHub API 为你将 Pages 设为 Actions 模式并启动打包！</p>
-                        </div>
-                        <button
-                          onClick={triggerPagesAutoSetup}
-                          disabled={isTriggeringPages}
-                          className="inline-flex items-center gap-1.5 bg-amber-900 hover:bg-black text-white font-bold text-xs px-4 py-2 rounded-xl transition shadow-sm shrink-0 disabled:opacity-50"
-                        >
-                          {isTriggeringPages ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5 text-amber-300 fill-amber-300" />}
-                          <span>⚡ 网页 API 一键开启 Pages & 启动 Actions</span>
-                        </button>
-                      </div>
-
-                      {pagesStatus && (
-                        <div className="bg-emerald-100/90 border border-emerald-300 text-emerald-950 p-2.5 rounded-xl text-xs font-semibold flex items-center gap-2">
-                          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                          <span>{pagesStatus}</span>
-                        </div>
-                      )}
-
-                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-[11px] text-amber-800 pt-1 border-t border-amber-200/60">
-                        <span>✨ 网站在线预览地址：</span>
-                        <a
-                          href={`https://${username}.github.io/${repo}/`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 font-bold text-amber-950 underline shrink-0"
-                        >
-                          https://{username}.github.io/{repo}/ <ExternalLink className="w-3 h-3" />
-                        </a>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {/* Error Banner with Resumable Retry & Diagnostics */}
-                {uploadError && (
-                  <div className="bg-rose-50 border border-rose-200 text-rose-950 p-5 rounded-2xl space-y-4 text-xs shadow-sm">
-                    <div className="flex flex-col sm:flex-row items-start justify-between gap-3 border-b border-rose-200/80 pb-3">
-                      <div className="flex items-start gap-2.5">
-                        <ShieldAlert className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <span className="font-bold text-rose-900 text-sm">
-                              {errorDiagnostics?.title || '部署传输中断'}
-                            </span>
-                            {errorDiagnostics?.code && (
-                              <span className="font-mono text-[10px] bg-rose-200 text-rose-900 px-1.5 py-0.5 rounded font-semibold">
-                                {errorDiagnostics.code}
-                              </span>
-                            )}
-                          </div>
-                          <p className="text-rose-800 mt-1 leading-relaxed">
-                            {errorDiagnostics?.reason || uploadError}
-                          </p>
-                        </div>
-                      </div>
-
-                      <button
-                        onClick={handleUploadToGithub}
-                        disabled={isUploading}
-                        className="inline-flex items-center gap-1.5 bg-rose-900 hover:bg-black text-white font-bold px-4 py-2.5 rounded-xl transition shadow-sm shrink-0 self-end sm:self-start disabled:opacity-50"
-                      >
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin-reverse" />
-                        <span>断点继续上传</span>
-                      </button>
-                    </div>
-
-                    {/* Step by step diagnostic solutions */}
-                    {errorDiagnostics?.steps && errorDiagnostics.steps.length > 0 && (
-                      <div className="bg-white/90 border border-rose-200/80 rounded-xl p-3.5 space-y-2 text-rose-950">
-                        <div className="font-bold flex items-center gap-1.5 text-xs text-rose-900">
-                          <Wrench className="w-3.5 h-3.5 text-rose-700" />
-                          <span>推荐排查与一键排障流程：</span>
-                        </div>
-                        <ul className="space-y-1.5 text-[11px] pl-1">
-                          {errorDiagnostics.steps.map((step, idx) => (
-                            <li key={idx} className="flex items-start gap-1.5 leading-relaxed">
-                              <span className="font-mono font-bold text-rose-700 shrink-0">{idx + 1}.</span>
-                              <div className="flex-1">
-                                <span>{step.text}</span>
-                                {step.linkUrl && (
-                                  <a
-                                    href={step.linkUrl}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="ml-1 font-bold underline text-rose-900 hover:text-black inline-flex items-center gap-0.5"
-                                  >
-                                    [{step.linkText || '点击前往管理页'}] <ExternalLink className="w-2.5 h-2.5" />
-                                  </a>
-                                )}
-                              </div>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-
-                    <div className="text-[11px] text-rose-800/90 flex items-center gap-1.5 pt-0.5">
-                      <LifeBuoy className="w-3.5 h-3.5 text-rose-600 shrink-0" />
-                      <span>遇到复杂问题？可以随时切换到上方【4. 报错与故障排查手册】查看所有错误对照表。</span>
-                    </div>
-                  </div>
-                )}
-
-                {/* File Search Bar */}
-                <div className="flex items-center justify-between gap-3">
-                  <div className="relative flex-1">
-                    <Search className="w-3.5 h-3.5 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                    <input
-                      type="text"
-                      value={fileSearch}
-                      onChange={(e) => {
-                        setFileSearch(e.target.value);
-                        setVisibleFileCount(100);
-                      }}
-                      placeholder="搜索解压出的文件路径..."
-                      className="w-full bg-[#f8f8f7] border border-neutral-200 rounded-xl pl-9 pr-3 py-1.5 text-xs text-neutral-800 focus:outline-none focus:border-neutral-800 transition"
-                    />
-                  </div>
-                  <span className="text-[11px] text-neutral-400 font-mono">
-                    匹配 {filteredFiles.length} / {extractedFiles.length} 项
-                  </span>
-                </div>
-
-                {/* File Tree List */}
-                <div className="bg-[#f8f8f7] border border-neutral-200/80 rounded-2xl p-3 max-h-56 overflow-y-auto font-mono text-xs text-neutral-700 divide-y divide-neutral-200/50">
-                  {filteredFiles.slice(0, visibleFileCount).map((file, idx) => (
-                    <div key={idx} className="py-1.5 px-2 flex items-center justify-between hover:bg-white rounded-xl transition">
-                      <span className="truncate pr-4 text-neutral-800">{file.path}</span>
-                      <span className="text-[11px] text-neutral-400 shrink-0">{(file.size / 1024).toFixed(1)} KB</span>
-                    </div>
-                  ))}
-                  {filteredFiles.length > visibleFileCount && (
-                    <div className="py-2 text-center pt-3">
-                      <button
-                        type="button"
-                        onClick={() => setVisibleFileCount(prev => prev + 300)}
-                        className="inline-flex items-center gap-1.5 text-xs font-semibold text-neutral-700 hover:text-black bg-white border border-neutral-200 px-4 py-1.5 rounded-xl transition shadow-sm"
-                      >
-                        <span>显示更多文件 (已载入 {visibleFileCount} / 剩余 {filteredFiles.length - visibleFileCount} 项)</span>
-                      </button>
-                    </div>
-                  )}
-                  {filteredFiles.length === 0 && (
-                    <div className="py-4 text-center text-neutral-400 text-xs">
-                      未找到符合条件的文件
-                    </div>
-                  )}
-                </div>
-
-                {/* Activity Log */}
-                {logs.length > 0 && (
-                  <div className="space-y-1.5 pt-2">
-                    <span className="text-xs font-bold text-neutral-400 uppercase tracking-wider">交互执行日志</span>
-                    <div className="bg-black text-neutral-100 p-4 rounded-2xl font-mono text-[11px] max-h-40 overflow-y-auto space-y-1 shadow-inner">
-                      {logs.map((log) => (
-                        <div key={log.id} className="flex gap-2">
-                          <span className="text-neutral-500 shrink-0">[{log.time}]</span>
-                          <span className={
-                            log.status === 'success' ? 'text-emerald-400' :
-                            log.status === 'error' ? 'text-rose-400' : 'text-neutral-300'
-                          }>
-                            {log.message}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-              </div>
-            )}
-
-          </div>
-        )}
-
-        {/* TAB 2: Termux Script (.sh) */}
-        {activeTab === 'termux-script' && (
-          <div className="bg-white rounded-[28px] border border-neutral-200/80 p-6 md:p-8 space-y-6 shadow-[0_8px_30px_rgb(0,0,0,0.03)]">
-            
-            {/* 1-Line Termux Command */}
-            <div className="bg-amber-50 border border-amber-200/80 rounded-2xl p-5 space-y-3">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-amber-200/60 pb-2">
-                <div className="flex items-center gap-2">
-                  <Zap className="w-4 h-4 text-amber-600 fill-amber-500" />
-                  <h4 className="font-bold text-amber-950 text-sm">Termux 手机一键自动补救命令（无需找 Save 键）</h4>
-                </div>
-                <button
-                  onClick={() => handleCopy(termuxOneLiner, 'termux-one-liner')}
-                  className="inline-flex items-center gap-1.5 bg-amber-900 hover:bg-black text-white text-xs px-4 py-1.5 rounded-full font-semibold transition shrink-0"
-                >
-                  {copiedKey === 'termux-one-liner' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copiedKey === 'termux-one-liner' ? '已复制命令' : '复制 Termux 单行命令'}</span>
-                </button>
-              </div>
-              <p className="text-xs text-amber-900 leading-relaxed">
-                如果在 GitHub 网页找不到开启 Pages 或 Actions 的按钮，在手机 Termux 里打开，粘贴运行下方这条命令，Termux 就会<strong>自动通过 API 帮你在后台把 GitHub Pages 开启并立刻触发打包部署</strong>：
-              </p>
-              <div className="bg-black text-amber-300 p-3.5 rounded-xl font-mono text-xs overflow-x-auto select-all shadow-inner border border-neutral-800">
-                <code>{termuxOneLiner}</code>
-              </div>
-            </div>
-
-            {/* Complete bash script */}
-            <div className="space-y-3">
-              <div className="flex items-center justify-between border-b border-neutral-100 pb-3">
-                <div>
-                  <h3 className="font-bold text-neutral-900 text-sm flex items-center gap-2">
-                    <Terminal className="w-4 h-4 text-neutral-800" /> deploy.sh (Termux 手机全自动推送 + API 开启 Pages 脚本)
-                  </h3>
-                  <p className="text-xs text-neutral-400 mt-0.5">可以在手机 Termux 中保存为 deploy.sh 运行，包含本地 Git 强推 + API 全自动开启 Pages</p>
-                </div>
-
-                <button
-                  onClick={() => handleCopy(deployShContent, 'deploy-sh')}
-                  className="inline-flex items-center gap-1.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-800 text-xs px-4 py-2 rounded-full font-semibold transition"
-                >
-                  {copiedKey === 'deploy-sh' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copiedKey === 'deploy-sh' ? '已复制' : '复制 deploy.sh'}</span>
-                </button>
-              </div>
-
-              <div className="bg-black text-neutral-100 p-4.5 rounded-2xl font-mono text-xs overflow-x-auto leading-relaxed shadow-inner">
-                <pre>{deployShContent}</pre>
-              </div>
-            </div>
-
-          </div>
-        )}
-
-        {/* TAB 3: GitHub Actions (.yml) */}
-        {activeTab === 'github-action' && (
-          <div className="bg-white rounded-[28px] border border-neutral-200/80 p-6 md:p-8 space-y-4 shadow-[0_8px_30px_rgb(0,0,0,0.03)]">
-            <div className="flex items-center justify-between border-b border-neutral-100 pb-3">
-              <div>
-                <h3 className="font-bold text-neutral-900 text-sm flex items-center gap-2">
-                  <FileCode className="w-4 h-4 text-neutral-800" /> .github/workflows/unzip-and-deploy.yml
-                </h3>
-                <p className="text-xs text-neutral-400 mt-0.5">存入仓库后，以后直接在 GitHub 网页上传 zip，Actions 会自动在云端解压并覆盖替换</p>
-              </div>
-
-              <button
-                onClick={() => handleCopy(actionYamlContent, 'action-yml')}
-                className="inline-flex items-center gap-1.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-800 text-xs px-4 py-2 rounded-full font-semibold transition"
-              >
-                {copiedKey === 'action-yml' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                <span>{copiedKey === 'action-yml' ? '已复制' : '复制 YML 代码'}</span>
-              </button>
-            </div>
-
-            <div className="bg-black text-neutral-100 p-4.5 rounded-2xl font-mono text-xs overflow-x-auto leading-relaxed shadow-inner">
-              <pre>{actionYamlContent}</pre>
-            </div>
-          </div>
-        )}
-
-        {/* TAB 4: Troubleshooting & FAQ */}
-        {activeTab === 'faq' && (
-          <div className="bg-white rounded-[28px] border border-neutral-200/80 p-6 md:p-8 space-y-6 shadow-[0_8px_30px_rgb(0,0,0,0.03)] text-xs md:text-sm text-neutral-700">
-            <div className="border-b border-neutral-100 pb-4 space-y-1">
-              <div className="flex items-center gap-2">
-                <ShieldAlert className="w-5 h-5 text-rose-600 shrink-0" />
-                <h3 className="text-base font-bold text-neutral-900">
-                  常见报错代码与自助排障全集
-                </h3>
-              </div>
-              <p className="text-neutral-500 text-xs">
-                即便你在上学无法实时帮忙，朋友遇到任何报错也可以通过本对照表秒查秒解决！
-              </p>
-            </div>
-
-            {/* Error Encyclopedia Section */}
-            <div className="space-y-3">
-              <h4 className="font-bold text-neutral-900 text-xs md:text-sm flex items-center gap-1.5">
-                <Wrench className="w-4 h-4 text-neutral-800" />
-                所有报错类型速查表 (Top 10 Common Errors)
-              </h4>
-
-              <div className="grid grid-cols-1 gap-3.5">
-                
-                {/* Error 1 */}
-                <div className="bg-rose-50/50 border border-rose-200/80 p-4 rounded-2xl space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-bold text-rose-900 text-xs md:text-sm">
-                      1. 提示 <code>tree.sha ... is not a valid blob</code>（断点索引失效）
-                    </span>
-                    <span className="font-mono text-[10px] bg-rose-200/80 text-rose-900 px-2 py-0.5 rounded font-bold">
-                      ERR_CACHE_BLOB_EXPIRED
-                    </span>
-                  </div>
-                  <p className="text-neutral-600 text-xs leading-relaxed">
-                    <strong>原因：</strong> 传输中途网络掉线或手机切后台挂起，导致 GitHub 端的临时 Blob 块未正常持久化。
-                  </p>
-                  <div className="bg-white p-2.5 rounded-xl border border-rose-200/60 text-xs text-rose-950 font-medium">
-                    💡 <strong>解决办法：</strong> 无需重新拖入 ZIP 包，直接点击排错框中的<strong>「断点继续上传」</strong>按钮。网页会自动清除无效缓存并全量同步，秒级恢复！
-                  </div>
-                </div>
-
-                {/* Error 2 */}
-                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
-                      2. 提示 <code>401 Bad Credentials</code> 或 Token 无效
-                    </span>
-                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
-                      ERR_TOKEN_401_INVALID
-                    </span>
-                  </div>
-                  <p className="text-neutral-600 text-xs leading-relaxed">
-                    <strong>原因：</strong> GitHub Token 复制错误、末尾包含了空格或换行，或者 Token 已过期/在 GitHub 端被删除了。
-                  </p>
-                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
-                    💡 <strong>解决办法：</strong> 重新在 GitHub 生成新 Token（开启 <code className="bg-neutral-100 px-1 py-0.5 rounded">repo</code> 权限），然后粘贴到网页顶部的 Token 输入框中。
-                  </div>
-                </div>
-
-                {/* Error 3 */}
-                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
-                      3. 提示 <code>404 Not Found</code> 找不到仓库
-                    </span>
-                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
-                      ERR_REPO_404_NOT_FOUND
-                    </span>
-                  </div>
-                  <p className="text-neutral-600 text-xs leading-relaxed">
-                    <strong>原因：</strong> 1. GitHub 用户名或仓库名拼写错误（区分大小写）；2. 仓库是私有仓库 (Private Repo)，但 Token 没勾选 repo 读写权限导致无法访问。
-                  </p>
-                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
-                    💡 <strong>解决办法：</strong> 确认用户名和仓库名无空格拼错，并在重新生成 Token 时勾选完整的 <code className="bg-neutral-100 px-1 py-0.5 rounded">repo</code> 读写权限。
-                  </div>
-                </div>
-
-                {/* Error 4 */}
-                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
-                      4. 提示 <code>403 Forbidden</code> 或 <code>Resource not accessible</code>
-                    </span>
-                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
-                      ERR_TOKEN_403_PERMISSION
-                    </span>
-                  </div>
-                  <p className="text-neutral-600 text-xs leading-relaxed">
-                    <strong>原因：</strong> 使用了 GitHub 新版细粒度 Token (Fine-grained PAT)，但未给予 Repository contents 写入支持。
-                  </p>
-                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
-                    💡 <strong>解决办法：</strong> 前往 GitHub Token 设置，将 <code className="bg-neutral-100 px-1 py-0.5 rounded">Repository permissions -&gt; Contents</code> 设置为 <strong>Read and write (读与写)</strong>。
-                  </div>
-                </div>
-
-                {/* Error 5 */}
-                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
-                      5. 提示 <code>Protected branch</code>（分支保护限制）
-                    </span>
-                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
-                      ERR_BRANCH_PROTECTION
-                    </span>
-                  </div>
-                  <p className="text-neutral-600 text-xs leading-relaxed">
-                    <strong>原因：</strong> 仓库的分支（如 <code className="bg-neutral-100 px-1 py-0.5 rounded">main</code>）开启了分支保护规则（Branch protection rule），禁止直接强制覆写。
-                  </p>
-                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
-                    💡 <strong>解决办法：</strong> 前往仓库 <code className="bg-neutral-100 px-1 py-0.5 rounded">Settings -&gt; Branches</code> 暂时解禁保护规则，或者将上面的「目标分支名」修改为 <code className="bg-neutral-100 px-1 py-0.5 rounded">gh-pages</code> 部署到新分支。
-                  </div>
-                </div>
-
-                {/* Error 6 */}
-                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
-                      6. 提示 <code>429 Rate Limit Exceeded</code>（接口限流）
-                    </span>
-                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
-                      ERR_API_RATE_LIMIT
-                    </span>
-                  </div>
-                  <p className="text-neutral-600 text-xs leading-relaxed">
-                    <strong>原因：</strong> 项目小文件过多或短期内发送 API 较多，触发了 GitHub 的平滑防刷限制。
-                  </p>
-                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
-                    💡 <strong>解决办法：</strong> 静置等待 30 秒，然后点击「断点继续上传」即可继续，网页已内置自动缓释和降频重试机制。
-                  </div>
-                </div>
-
-                {/* Error 7 */}
-                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
-                      7. GitHub Pages 页面找不到 Save 按钮或开启后白屏
-                    </span>
-                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
-                      PAGES_NO_SAVE_BUTTON
-                    </span>
-                  </div>
-                  <p className="text-neutral-600 text-xs leading-relaxed">
-                    <strong>原因：</strong> 当将 Build and deployment 切换为 GitHub Actions 时，配置是<strong>自动保存生效</strong>的，所以不会出现 Save 按钮；网页白屏通常是项目资源路径使用了绝对路径。
-                  </p>
-                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
-                    💡 <strong>解决办法：</strong> 上传成功后直接点击网页面板里的<strong>「⚡ 网页 API 一键开启 Pages &amp; 启动 Actions」</strong>即可自动拉起打包；同时静态项目打包时请保持相对路径（如 <code className="bg-neutral-100 px-1 py-0.5 rounded">base: './'</code>）。
-                  </div>
-                </div>
-
-                {/* Error 8 */}
-                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
-                      8. 提示 <code>422 Tree cannot be empty</code>（文件树为空）
-                    </span>
-                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
-                      ERR_TREE_EMPTY
-                    </span>
-                  </div>
-                  <p className="text-neutral-600 text-xs leading-relaxed">
-                    <strong>原因：</strong> ZIP 压缩包内只有系统垃圾文件（如 <code className="bg-neutral-100 px-1 py-0.5 rounded">.DS_Store</code>）或者为空压缩包，净化过滤后没有剩余有效代码文件。
-                  </p>
-                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
-                    💡 <strong>解决办法：</strong> 重新打包代码 ZIP，确保压缩包内包含正常的源码文件或 <code className="bg-neutral-100 px-1 py-0.5 rounded">index.html</code>。
-                  </div>
-                </div>
-
-                {/* Error 9 */}
-                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
-                      9. 手机上传提示 <code>Failed to fetch / NetworkError</code>
-                    </span>
-                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
-                      ERR_NETWORK_ABORT
-                    </span>
-                  </div>
-                  <p className="text-neutral-600 text-xs leading-relaxed">
-                    <strong>原因：</strong> 手机端切去微信回复消息或屏幕休眠锁屏，浏览器暂停了后台 JS 脚本与网络请求。
-                  </p>
-                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
-                    💡 <strong>解决办法：</strong> 返回浏览器，点击<strong>「断点继续上传」</strong>，系统会自动续传未完成部分。传输期间保持手机亮屏在前台即可。
-                  </div>
-                </div>
-
-                {/* Error 10 */}
-                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
-                      10. GitHub Actions 运行报错 <code>Process completed with exit code 1</code>
-                    </span>
-                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
-                      ERR_WORKFLOW_FAILED
-                    </span>
-                  </div>
-                  <p className="text-neutral-600 text-xs leading-relaxed">
-                    <strong>原因：</strong> GitHub 仓库默认的 Actions 工作流权限受限（只读模式），导致部署构建被拒。
-                  </p>
-                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
-                    💡 <strong>解决办法：</strong> 进入 GitHub 仓库 <code className="bg-neutral-100 px-1 py-0.5 rounded">Settings -&gt; Actions -&gt; General</code>，下拉到最底部的 <strong>Workflow permissions</strong>，勾选 <strong>Read and write permissions</strong>，然后保存！
-                  </div>
-                </div>
-
-                {/* Error 11 */}
-                <div className="bg-[#f9f9f8] border border-neutral-200/80 p-4 rounded-2xl space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-bold text-neutral-900 text-xs md:text-sm">
-                      11. 浏览器存在旧缓存，导致看到的还是旧版网页
-                    </span>
-                    <span className="font-mono text-[10px] bg-neutral-200 text-neutral-800 px-2 py-0.5 rounded font-bold">
-                      CACHE_STALE_PAGE
-                    </span>
-                  </div>
-                  <p className="text-neutral-600 text-xs leading-relaxed">
-                    <strong>原因：</strong> 浏览器默认对静态网页资源（JS/CSS）有长时间强缓存或 ServiceWorker 离线缓存，导致代码更新后浏览器仍在使用本地旧文件。
-                  </p>
-                  <div className="bg-white p-2.5 rounded-xl border border-neutral-200 text-xs text-neutral-800">
-                    💡 <strong>解决办法：</strong> 直接点击网页顶部 Logo 旁边的<strong>刷新图标 🔄</strong>，系统会自动擦除离线缓存并带时间戳强制拉取最新网页。
-                  </div>
-                </div>
-
-              </div>
-            </div>
-
-            {/* General Guidance Section */}
-            <div className="pt-4 border-t border-neutral-100 space-y-4">
-              <h4 className="font-bold text-neutral-900 text-xs md:text-sm flex items-center gap-1.5">
-                <BookOpen className="w-4 h-4 text-neutral-800" />
-                常见核心问答 (FAQ)
-              </h4>
-
-              <div className="space-y-3">
-                <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
-                  <h5 className="font-bold text-neutral-900 text-xs">为什么用这个网页可以解决以前传错文件夹的问题？</h5>
-                  <p className="text-neutral-500 text-xs leading-relaxed">
-                    因为开启了“强制清空重置”选项后，程序在构造 Git 节点树时不会继承以前远端的旧文件节点，而是把当前 ZIP 文件树作为**唯一的源码全集**提交覆写，以前传错的各种多余路径和乱七八糟文件都会被一次性清除干干净净！
-                  </p>
-                </div>
-
-                <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
-                  <h5 className="font-bold text-neutral-900 text-xs">压缩包里面有一层总文件夹怎么办？</h5>
-                  <p className="text-neutral-500 text-xs leading-relaxed">
-                    不用担心！本工具内部集成了自动嵌套提取算法，如果检测到你的 ZIP 压缩包内部只有一层总文件夹（例如 <code className="bg-white border px-1 py-0.5 rounded font-mono">my-project/index.html</code>），会自动帮你提炼出内部文件（自动打平变成根目录下的 <code className="bg-white border px-1 py-0.5 rounded font-mono">index.html</code>）。
-                  </p>
-                </div>
-
-                <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
-                  <h5 className="font-bold text-neutral-900 text-xs">提示 "Git Repository is empty" 是什么意思？</h5>
-                  <p className="text-neutral-500 text-xs leading-relaxed">
-                    这意味着你在 GitHub 上新建的仓库是**完全空白**的（没有勾选 "Add a README file"，里面 0 个 commit，连 <code className="bg-white border px-1 py-0.5 rounded font-mono">main</code> 默认分支都还没建立）。不用担心，直接用本网页拖入 ZIP 点击全量上传，系统会自动帮你建立初始提交并创建好 <code className="bg-white border px-1 py-0.5 rounded font-mono">main</code> 分支！
-                  </p>
-                </div>
-
-                <div className="bg-[#f9f9f8] p-4 rounded-2xl border border-neutral-200/60 space-y-1">
-                  <h5 className="font-bold text-neutral-900 text-xs">安全保障与隐私声明</h5>
-                  <p className="text-neutral-500 text-xs leading-relaxed">
-                    本网页完全由纯前端运行（基于 GitHub 官方公开 REST API），你的 Token 只存在于你自己的浏览器内存中，绝对不会上传到任何中间服务器，你可以非常放心、安全地把本项目仓库开源或者分享给朋友使用！
-                  </p>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Subtle Footer */}
-        <footer className="pt-8 pb-4 text-center text-xs text-neutral-400 space-y-1.5 border-t border-neutral-200/60">
-          <p className="font-mono text-[11px]">zipdeploy monochrome • client-side pure static tool</p>
-          <div className="flex items-center justify-center gap-3 text-[11px]">
-            <button
-              type="button"
-              onClick={handleForceUpdateSite}
-              disabled={isRefreshingSite}
-              className="inline-flex items-center gap-1 text-neutral-500 hover:text-neutral-900 transition underline underline-offset-2"
-            >
-              <RefreshCw className={`w-3 h-3 ${isRefreshingSite ? 'animate-spin' : ''}`} />
-              <span>{isRefreshingSite ? '正在清除缓存并更新...' : '遇到缓存问题？强制更新网页'}</span>
-            </button>
-          </div>
-        </footer>
-
-      </main>
+      {/* One-Click Create Repository Modal */}
+      <CreateRepoModal
+        open={createRepoModalOpen}
+        onClose={() => setCreateRepoModalOpen(false)}
+        defaultRepoName={repo}
+        hasExtractedFiles={extractedFiles.length > 0}
+        isCreating={isCreatingRepo}
+        error={createRepoError}
+        createdSuccessName={createdRepoSuccessName}
+        onCreateRepo={handleCreateRepo}
+      />
     </div>
   );
 }

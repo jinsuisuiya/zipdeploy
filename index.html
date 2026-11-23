@@ -1,13 +1,31 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>zipdeploy</title>
+    <title>zipdeploy — 极简 ZIP 解压与 GitHub 自动部署工作台</title>
+    <meta name="description" content="Minimalist browser-based ZIP extractor and GitHub REST API auto deployer." />
+    <meta property="og:title" content="zipdeploy — 极简 ZIP 解压与 GitHub 自动部署工作台" />
+    <meta property="og:description" content="Minimalist browser-based ZIP extractor and GitHub REST API auto deployer." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem('zd_theme');
+          if (saved === 'dark' || (!saved && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+            document.documentElement.classList.add('dark');
+          }
+        } catch (e) {}
+      })();
+    </script>
   </head>
-  <body>
+  <body class="bg-[#F8F8F7] dark:bg-[#0B0B0C] text-[#141413] dark:text-[#F4F4F5] antialiased selection:bg-neutral-200 dark:selection:bg-neutral-800">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
-
