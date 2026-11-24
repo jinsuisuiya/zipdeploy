@@ -18,15 +18,19 @@ import {
   uint8ToBase64Fast,
   computeGitBlobSha,
   scanFilesForSecrets,
+  LARGE_FILE_WARN_BYTES,
   type WorkspaceProfile,
   type SecurityFinding,
   type TokenCheckResult,
   type ActionRunInfo,
-  type CommitHistoryItem
+  type CommitHistoryItem,
+  type DiffEntry,
+  type DiffPreviewResult,
+  type DeployHistoryRecord
 } from './utils/deployHelpers';
 import { Sidebar, type ActiveView } from './components/Sidebar';
 import { QuickDrawer, type QuickDrawerTab } from './components/QuickDrawer';
-import { DeployWorkspace } from './components/DeployWorkspace';
+import { DeployWorkspace, type SourcePackageInfo } from './components/DeployWorkspace';
 import { GuideView } from './components/GuideView';
 import { ScriptsView } from './components/ScriptsView';
 import { FaqView } from './components/FaqView';
@@ -35,6 +39,8 @@ import { SecurityWarningModal } from './components/SecurityWarningModal';
 import { FilePreviewModal } from './components/FilePreviewModal';
 import { RollbackModal } from './components/RollbackModal';
 import { CreateRepoModal } from './components/CreateRepoModal';
+import { DiffPreviewModal } from './components/DiffPreviewModal';
+import { DeployHistoryModal } from './components/DeployHistoryModal';
 
 const VIEW_TITLES: Record<ActiveView, string> = {
   deploy: '部署工作台',
@@ -46,6 +52,7 @@ const VIEW_TITLES: Record<ActiveView, string> = {
 const WELCOME_STORAGE_KEY = 'zd_welcome_accepted_v1';
 const PROFILES_STORAGE_KEY = 'zd_profiles_v1';
 const ACTIVE_PROFILE_STORAGE_KEY = 'zd_active_profile_v1';
+const DEPLOY_HISTORY_STORAGE_KEY = 'zd_deploy_history_v1';
 
 export default function App() {
   // Welcome / First-Visit Safety Notice Modal
@@ -315,9 +322,11 @@ export default function App() {
     }
   }, [token, username, repo, email, branch, targetSubdir, saveLocally]);
 
-  // File Extraction States
-  const [zipFile, setZipFile] = useState<File | null>(null);
+  // File Extraction & Exclusion States
+  const rawLoadedEntriesRef = useRef<{ path: string; content: Uint8Array }[] | null>(null);
+  const [sourceInfo, setSourceInfo] = useState<SourcePackageInfo | null>(null);
   const [extractedFiles, setExtractedFiles] = useState<ExtractedFile[]>([]);
+  const [excludedPaths, setExcludedPaths] = useState<Set<string>>(new Set());
   const [isUnzipping, setIsUnzipping] = useState<boolean>(false);
   const [unzipError, setUnzipError] = useState<string | null>(null);
   const [fileSearch, setFileSearch] = useState<string>('');
@@ -356,6 +365,31 @@ export default function App() {
   const [isCreatingRepo, setIsCreatingRepo] = useState<boolean>(false);
   const [createRepoError, setCreateRepoError] = useState<string | null>(null);
   const [createdRepoSuccessName, setCreatedRepoSuccessName] = useState<string | null>(null);
+
+  // Diff Preview Modal States
+  const [diffModalOpen, setDiffModalOpen] = useState<boolean>(false);
+  const [isComputingDiff, setIsComputingDiff] = useState<boolean>(false);
+  const [diffError, setDiffError] = useState<string | null>(null);
+  const [diffResult, setDiffResult] = useState<DiffPreviewResult | null>(null);
+
+  // Local Deploy History States
+  const [deployHistory, setDeployHistory] = useState<DeployHistoryRecord[]>(() => {
+    try {
+      const raw = localStorage.getItem(DEPLOY_HISTORY_STORAGE_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [historyModalOpen, setHistoryModalOpen] = useState<boolean>(false);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(DEPLOY_HISTORY_STORAGE_KEY, JSON.stringify(deployHistory));
+    } catch {
+      // ignore
+    }
+  }, [deployHistory]);
 
   useEffect(() => {
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
@@ -407,6 +441,7 @@ export default function App() {
   };
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
 
   const addLog = (message: string, status: 'pending' | 'success' | 'error' | 'info' = 'info') => {
     const timeStr = new Date().toLocaleTimeString();
@@ -677,9 +712,10 @@ export default function App() {
       });
       setCreatedRepoSuccessName(fullName);
 
-      if (autoPushAfterCreate && extractedFiles.length > 0) {
+      const activeFiles = extractedFiles.filter((f) => !excludedPaths.has(f.path));
+      if (autoPushAfterCreate && activeFiles.length > 0) {
         setCreateRepoModalOpen(false);
-        const findings = scanFilesForSecrets(extractedFiles);
+        const findings = scanFilesForSecrets(activeFiles);
         if (findings.length > 0) {
           setSecurityFindings(findings);
         } else {
@@ -817,142 +853,205 @@ export default function App() {
     }
   };
 
+  const handleFolderChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    try {
+      const files = e.target.files;
+      if (!files || files.length === 0) return;
+      await processFolderFiles(Array.from(files));
+    } catch (err: any) {
+      console.error(err);
+      setUnzipError(`文件夹读取异常: ${err.message || '系统发生未知错误'}`);
+    } finally {
+      if (e.target) {
+        e.target.value = '';
+      }
+    }
+  };
+
+  const readDroppedEntriesRecursive = async (
+    items: DataTransferItemList
+  ): Promise<{ entries: { path: string; content: Uint8Array }[]; rootFolderName: string } | null> => {
+    const webkitEntries: any[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const entry = (items[i] as any).webkitGetAsEntry?.();
+      if (entry) webkitEntries.push(entry);
+    }
+    if (webkitEntries.length === 0) return null;
+
+    // If it's just a single .zip file, let ZIP pipeline handle it
+    if (webkitEntries.length === 1 && webkitEntries[0].isFile && webkitEntries[0].name.toLowerCase().endsWith('.zip')) {
+      return null;
+    }
+
+    const collected: { path: string; content: Uint8Array }[] = [];
+
+    const readFileFromEntry = (fileEntry: any): Promise<File> =>
+      new Promise((resolve, reject) => fileEntry.file(resolve, reject));
+
+    const readAllDirEntries = async (dirEntry: any): Promise<any[]> => {
+      const reader = dirEntry.createReader();
+      const all: any[] = [];
+      while (true) {
+        const batch: any[] = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+        if (!batch || batch.length === 0) break;
+        all.push(...batch);
+      }
+      return all;
+    };
+
+    const traverse = async (entry: any, prefix: string) => {
+      const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isFile) {
+        try {
+          const f = await readFileFromEntry(entry);
+          const buf = await f.arrayBuffer();
+          collected.push({ path: relPath, content: new Uint8Array(buf) });
+        } catch (err) {
+          console.warn(`跳过无法读取的文件 [${relPath}]:`, err);
+        }
+      } else if (entry.isDirectory) {
+        const children = await readAllDirEntries(entry);
+        for (const child of children) {
+          await traverse(child, relPath);
+        }
+      }
+    };
+
+    for (const entry of webkitEntries) {
+      await traverse(entry, '');
+    }
+
+    const rootFolderName =
+      webkitEntries.length === 1 && webkitEntries[0].isDirectory
+        ? webkitEntries[0].name
+        : `folder-upload-${collected.length}-files`;
+
+    return { entries: collected, rootFolderName };
+  };
+
   const handleDrop = async (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     try {
+      const items = e.dataTransfer.items;
+      if (items && items.length > 0) {
+        const droppedFolder = await readDroppedEntriesRecursive(items);
+        if (droppedFolder && droppedFolder.entries.length > 0) {
+          const totalSize = droppedFolder.entries.reduce((acc, item) => acc + item.content.byteLength, 0);
+          applyRawEntriesToWorkspace(
+            droppedFolder.entries,
+            { name: droppedFolder.rootFolderName, totalSize, kind: 'folder' },
+            ignoreNodeModules,
+            true
+          );
+          return;
+        }
+      }
+
       const file = e.dataTransfer.files?.[0];
       if (file && (file.name.endsWith('.zip') || file.type.includes('zip'))) {
         await processZipFile(file);
       } else {
-        setUnzipError('请上传标准的 .zip 格式压缩包');
+        setUnzipError('请拖入标准的 .zip 压缩包或本地项目文件夹');
       }
     } catch (err: any) {
       console.error(err);
-      setUnzipError(`文件拖拽解析异常: ${err.message || '格式不受支持'}`);
+      setUnzipError(`文件或文件夹拖拽解析异常: ${err.message || '格式不受支持'}`);
     }
   };
 
-  const processZipFile = async (file: File, skipNodeModules = ignoreNodeModules) => {
-    setZipFile(file);
-    setIsUnzipping(true);
+  const applyRawEntriesToWorkspace = (
+    rawEntries: { path: string; content: Uint8Array }[],
+    pkgInfo: SourcePackageInfo,
+    skipNodeModules: boolean,
+    resetExclusions = true
+  ) => {
+    rawLoadedEntriesRef.current = rawEntries;
+    setSourceInfo(pkgInfo);
     setUnzipError(null);
     setUploadSuccess(false);
     setUploadError(null);
     setLatestActionRun(null);
     setLogs([]);
     setVisibleFileCount(100);
+    if (resetExclusions) {
+      setExcludedPaths(new Set());
+    }
 
-    try {
-      const decodeZipFileName = (bytes: Uint8Array): string => {
-        try {
-          return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-        } catch {
-          try {
-            return new TextDecoder('gbk').decode(bytes);
-          } catch {
-            return new TextDecoder().decode(bytes);
-          }
-        }
-      };
-
-      const zip = new JSZip();
-      const zipContent = await zip.loadAsync(file, { decodeFileName: decodeZipFileName });
-      const fileList: ExtractedFile[] = [];
-
-      const rawPaths = Object.keys(zipContent.files);
-
-      const validEntries = rawPaths.filter((relativePath) => {
-        const zipEntry = zipContent.files[relativePath];
-        if (zipEntry.dir || relativePath.endsWith('/')) return false;
-
-        const normalized = relativePath.replace(/\\/g, '/');
+    const validEntries = rawEntries
+      .map((e) => e.path.replace(/\\/g, '/'))
+      .filter((normalized) => {
         const filename = normalized.split('/').pop() || '';
-
-        if (
+        return !(
           normalized.includes('__MACOSX/') ||
           normalized.startsWith('.git/') ||
           normalized.includes('/.git/') ||
           filename === '.DS_Store' ||
           filename === 'Thumbs.db' ||
           filename === 'desktop.ini'
-        ) {
-          return false;
-        }
-        return true;
+        );
       });
 
-      let rootPrefix = '';
-      if (validEntries.length > 0) {
-        const firstNormalized = validEntries[0].replace(/\\/g, '/');
-        const firstParts = firstNormalized.split('/');
-        if (firstParts.length > 1) {
-          const candidatePrefix = firstParts[0] + '/';
-          const allShare = validEntries.every((p) => p.replace(/\\/g, '/').startsWith(candidatePrefix));
-          if (allShare) {
-            rootPrefix = candidatePrefix;
-          }
+    let rootPrefix = '';
+    if (validEntries.length > 0) {
+      const firstParts = validEntries[0].split('/');
+      if (firstParts.length > 1) {
+        const candidatePrefix = firstParts[0] + '/';
+        if (validEntries.every((p) => p.startsWith(candidatePrefix))) {
+          rootPrefix = candidatePrefix;
+        }
+      }
+    }
+
+    let junkCount = 0;
+    let nodeModulesCount = 0;
+    const fileList: ExtractedFile[] = [];
+    const seenPaths = new Set<string>();
+
+    for (const entry of rawEntries) {
+      const normalized = entry.path.replace(/\\/g, '/');
+      const filename = normalized.split('/').pop() || '';
+
+      if (
+        normalized.includes('__MACOSX/') ||
+        normalized.endsWith('.DS_Store') ||
+        filename === '.DS_Store' ||
+        filename === 'Thumbs.db' ||
+        filename === 'desktop.ini' ||
+        normalized.startsWith('.git/') ||
+        normalized.includes('/.git/')
+      ) {
+        junkCount++;
+        continue;
+      }
+
+      if (normalized.startsWith('node_modules/') || normalized.includes('/node_modules/')) {
+        nodeModulesCount++;
+        if (skipNodeModules) {
+          continue;
         }
       }
 
-      let junkCount = 0;
-      let nodeModulesCount = 0;
-
-      for (const relativePath of Object.keys(zipContent.files)) {
-        const zipEntry = zipContent.files[relativePath];
-        if (zipEntry.dir || relativePath.endsWith('/')) continue;
-
-        const normalized = relativePath.replace(/\\/g, '/');
-        const filename = normalized.split('/').pop() || '';
-
-        if (
-          normalized.includes('__MACOSX/') ||
-          normalized.endsWith('.DS_Store') ||
-          filename === '.DS_Store' ||
-          filename === 'Thumbs.db' ||
-          filename === 'desktop.ini' ||
-          normalized.startsWith('.git/') ||
-          normalized.includes('/.git/')
-        ) {
-          junkCount++;
-          continue;
-        }
-
-        if (normalized.startsWith('node_modules/') || normalized.includes('/node_modules/')) {
-          nodeModulesCount++;
-          if (skipNodeModules) {
-            continue;
-          }
-        }
-
-        let cleanPath = normalized;
-        if (rootPrefix && cleanPath.startsWith(rootPrefix)) {
-          cleanPath = cleanPath.substring(rootPrefix.length);
-        }
-
-        cleanPath = sanitizeGitPath(cleanPath);
-        if (!cleanPath) continue;
-
-        if (fileList.some((f) => f.path === cleanPath)) {
-          continue;
-        }
-
-        try {
-          const contentUint8 = await zipEntry.async('uint8array');
-          fileList.push({
-            path: cleanPath,
-            size: contentUint8.byteLength,
-            isDir: false,
-            content: contentUint8
-          });
-        } catch (entryErr) {
-          console.warn(`跳过无法解压读取的文件 [${cleanPath}]:`, entryErr);
-        }
+      let cleanPath = normalized;
+      if (rootPrefix && cleanPath.startsWith(rootPrefix)) {
+        cleanPath = cleanPath.substring(rootPrefix.length);
       }
 
-      if (autoInjectPagesAction) {
-        const workflowPath = '.github/workflows/deploy-pages.yml';
-        if (!fileList.some((f) => f.path === workflowPath)) {
-          const pagesWorkflowYaml = `name: Deploy site to GitHub Pages
+      cleanPath = sanitizeGitPath(cleanPath);
+      if (!cleanPath || seenPaths.has(cleanPath)) continue;
+      seenPaths.add(cleanPath);
+
+      fileList.push({
+        path: cleanPath,
+        size: entry.content.byteLength,
+        isDir: false,
+        content: entry.content
+      });
+    }
+
+    if (autoInjectPagesAction) {
+      const workflowPath = '.github/workflows/deploy-pages.yml';
+      if (!seenPaths.has(workflowPath)) {
+        const pagesWorkflowYaml = `name: Deploy site to GitHub Pages
 
 on:
   push:
@@ -1021,32 +1120,134 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v4`;
 
-          const encoder = new TextEncoder();
-          const bytes = encoder.encode(pagesWorkflowYaml);
-          fileList.push({
-            path: workflowPath,
-            size: bytes.byteLength,
-            isDir: false,
-            content: bytes
-          });
+        const bytes = new TextEncoder().encode(pagesWorkflowYaml);
+        fileList.push({
+          path: workflowPath,
+          size: bytes.byteLength,
+          isDir: false,
+          content: bytes
+        });
+      }
+    }
+
+    setFilterStats({ junkCount, nodeModulesCount });
+    setExtractedFiles(fileList);
+  };
+
+  const processFolderFiles = async (files: File[], skipNodeModules = ignoreNodeModules) => {
+    setIsUnzipping(true);
+    setUnzipError(null);
+    try {
+      const entries: { path: string; content: Uint8Array }[] = [];
+      let totalSize = 0;
+      let folderName = '本地文件夹';
+
+      for (const f of files) {
+        const rel = (f as any).webkitRelativePath || f.name;
+        if (entries.length === 0 && rel.includes('/')) {
+          folderName = rel.split('/')[0];
+        }
+        const buf = await f.arrayBuffer();
+        totalSize += buf.byteLength;
+        entries.push({ path: rel, content: new Uint8Array(buf) });
+      }
+
+      if (entries.length === 0) {
+        throw new Error('所选文件夹为空');
+      }
+
+      applyRawEntriesToWorkspace(
+        entries,
+        { name: folderName, totalSize, kind: 'folder' },
+        skipNodeModules,
+        true
+      );
+    } catch (err: any) {
+      setUnzipError(`文件夹读取失败: ${err.message || '请重试'}`);
+    } finally {
+      setIsUnzipping(false);
+    }
+  };
+
+  const processZipFile = async (file: File, skipNodeModules = ignoreNodeModules) => {
+    setIsUnzipping(true);
+    setUnzipError(null);
+
+    try {
+      const decodeZipFileName = (bytes: Uint8Array): string => {
+        try {
+          return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        } catch {
+          try {
+            return new TextDecoder('gbk').decode(bytes);
+          } catch {
+            return new TextDecoder().decode(bytes);
+          }
+        }
+      };
+
+      const zip = new JSZip();
+      const zipContent = await zip.loadAsync(file, { decodeFileName: decodeZipFileName });
+      const rawEntries: { path: string; content: Uint8Array }[] = [];
+
+      for (const relativePath of Object.keys(zipContent.files)) {
+        const zipEntry = zipContent.files[relativePath];
+        if (zipEntry.dir || relativePath.endsWith('/')) continue;
+        try {
+          const contentUint8 = await zipEntry.async('uint8array');
+          rawEntries.push({ path: relativePath, content: contentUint8 });
+        } catch (entryErr) {
+          console.warn(`跳过无法解压读取的文件 [${relativePath}]:`, entryErr);
         }
       }
 
-      setFilterStats({ junkCount, nodeModulesCount });
-      setExtractedFiles(fileList);
-      setIsUnzipping(false);
+      applyRawEntriesToWorkspace(
+        rawEntries,
+        { name: file.name, totalSize: file.size, kind: 'zip' },
+        skipNodeModules,
+        true
+      );
     } catch (err: any) {
       console.error(err);
-      setIsUnzipping(false);
       setUnzipError(`压缩包解析失败: ${err.message || '文件损坏或非标准 ZIP 格式'}`);
+    } finally {
+      setIsUnzipping(false);
     }
   };
 
   const handleToggleNodeModules = (skip: boolean) => {
     setIgnoreNodeModules(skip);
-    if (zipFile) {
-      processZipFile(zipFile, skip);
+    if (rawLoadedEntriesRef.current && sourceInfo) {
+      applyRawEntriesToWorkspace(rawLoadedEntriesRef.current, sourceInfo, skip, false);
     }
+  };
+
+  const handleToggleExcludeFile = (path: string) => {
+    setExcludedPaths((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) {
+        next.delete(path);
+      } else {
+        next.add(path);
+      }
+      return next;
+    });
+  };
+
+  const handleExcludeAllLargeFiles = () => {
+    setExcludedPaths((prev) => {
+      const next = new Set(prev);
+      for (const f of extractedFiles) {
+        if (f.size >= LARGE_FILE_WARN_BYTES) {
+          next.add(f.path);
+        }
+      }
+      return next;
+    });
+  };
+
+  const handleRestoreAllExcluded = () => {
+    setExcludedPaths(new Set());
   };
 
   const blobShaCacheRef = useRef<Map<string, string>>(new Map());
@@ -1131,6 +1332,131 @@ jobs:
     throw lastError || new Error('网络请求多次重试失败，请检查网络或 GitHub 服务状态');
   };
 
+  // Compute remote Diff Preview before pushing
+  const computeRemoteDiff = async () => {
+    const cleanToken = token.trim();
+    const cleanU = username.trim().replace(/^https?:\/\/github\.com\//i, '').replace(/^\/+/, '').split('/')[0];
+    const cleanR = repo.trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/i, '').replace(/^\/+/, '');
+    const cleanB = branch.trim() || 'main';
+    const cleanSubdir = sanitizeGitPath(targetSubdir);
+    const activeFiles = extractedFiles.filter((f) => !excludedPaths.has(f.path));
+
+    if (!cleanToken) {
+      setDiffError('请先填写 GitHub Personal Access Token (PAT) 后再对比差异。');
+      setDiffResult(null);
+      return;
+    }
+    if (!cleanU || cleanU === 'your-username' || !cleanR || cleanR === 'your-repository') {
+      setDiffError('请先填写有效的 GitHub 用户名和仓库名。');
+      setDiffResult(null);
+      return;
+    }
+    if (activeFiles.length === 0) {
+      setDiffError('当前没有选中任何可对比的文件。');
+      setDiffResult(null);
+      return;
+    }
+
+    setIsComputingDiff(true);
+    setDiffError(null);
+
+    const headers = {
+      Authorization: `Bearer ${cleanToken}`,
+      Accept: 'application/vnd.github+json'
+    };
+
+    try {
+      const refRes = await fetch(
+        `https://api.github.com/repos/${cleanU}/${cleanR}/git/ref/heads/${encodeURIComponent(cleanB)}`,
+        { headers }
+      );
+
+      const remoteTreeShaMap = new Map<string, string>();
+      let isNewRepoOrBranch = false;
+
+      if (refRes.status === 404 || refRes.status === 409) {
+        isNewRepoOrBranch = true;
+      } else if (!refRes.ok) {
+        const errData = await refRes.json().catch(() => ({}));
+        throw new Error(formatApiError(errData, `读取远端分支失败 (${refRes.status})`));
+      } else {
+        const refData = await refRes.json();
+        const headSha = refData?.object?.sha;
+        if (headSha) {
+          const treeRes = await fetch(
+            `https://api.github.com/repos/${cleanU}/${cleanR}/git/trees/${headSha}?recursive=1`,
+            { headers }
+          );
+          if (treeRes.ok) {
+            const treeData = await treeRes.json();
+            if (Array.isArray(treeData?.tree)) {
+              for (const node of treeData.tree) {
+                if (node.type === 'blob' && node.path && node.sha) {
+                  remoteTreeShaMap.set(node.path, node.sha);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      const added: DiffEntry[] = [];
+      const modified: DiffEntry[] = [];
+      const deleted: DiffEntry[] = [];
+      let unchangedCount = 0;
+
+      const localTargetPaths = new Set<string>();
+
+      for (const file of activeFiles) {
+        const relativeNormalized = sanitizeGitPath(file.path);
+        if (!relativeNormalized) continue;
+        const fullRepoPath = cleanSubdir ? `${cleanSubdir}/${relativeNormalized}` : relativeNormalized;
+        localTargetPaths.add(fullRepoPath);
+
+        const remoteSha = remoteTreeShaMap.get(fullRepoPath);
+        if (!remoteSha) {
+          added.push({ path: fullRepoPath, status: 'added', localSize: file.size });
+        } else {
+          const localSha = await computeGitBlobSha(file.content);
+          if (localSha === remoteSha) {
+            unchangedCount++;
+          } else {
+            modified.push({ path: fullRepoPath, status: 'modified', localSize: file.size });
+          }
+        }
+      }
+
+      if (forcePush && !cleanSubdir && !isNewRepoOrBranch) {
+        for (const remotePath of remoteTreeShaMap.keys()) {
+          if (!localTargetPaths.has(remotePath)) {
+            deleted.push({ path: remotePath, status: 'deleted' });
+          }
+        }
+      }
+
+      setDiffResult({
+        targetLabel: `${cleanU}/${cleanR} (${cleanB}${cleanSubdir ? ` · ${cleanSubdir}/` : ''})`,
+        isNewRepoOrBranch,
+        forcePush,
+        targetSubdir: cleanSubdir,
+        added,
+        modified,
+        deleted,
+        unchangedCount
+      });
+    } catch (err: any) {
+      setDiffError(err.message || '拉取远端树并比对差异失败');
+      setDiffResult(null);
+    } finally {
+      setIsComputingDiff(false);
+    }
+  };
+
+  const handleOpenDiffPreview = () => {
+    setDiffModalOpen(true);
+    computeRemoteDiff();
+  };
+
   // Pre-upload entry point: runs secret scan first, asks confirmation if findings exist
   const handleInitiateUpload = () => {
     const cleanToken = token.trim();
@@ -1151,12 +1477,13 @@ jobs:
       setUploadError('请在配置栏填写您实际的 GitHub 用户名与仓库名称');
       return;
     }
-    if (extractedFiles.length === 0) {
-      setUploadError('尚未提取压缩包文件，请先上传 ZIP 包');
+    const activeFiles = extractedFiles.filter((f) => !excludedPaths.has(f.path));
+    if (activeFiles.length === 0) {
+      setUploadError('尚未选中任何待上传文件，请先上传压缩包或取消排除文件');
       return;
     }
 
-    const findings = scanFilesForSecrets(extractedFiles);
+    const findings = scanFilesForSecrets(activeFiles);
     if (findings.length > 0) {
       setSecurityFindings(findings);
       return;
@@ -1168,7 +1495,9 @@ jobs:
   // Core concurrent upload pipeline
   const executeUploadToGithub = async (overrides?: { overrideUsername?: string; overrideRepo?: string }) => {
     setSecurityFindings([]);
+    const uploadStartTime = performance.now();
     const cleanToken = token.trim();
+    const activeFiles = extractedFiles.filter((f) => !excludedPaths.has(f.path));
 
     const rawUser = overrides?.overrideUsername ?? username;
     const rawRepo = overrides?.overrideRepo ?? repo;
@@ -1224,7 +1553,7 @@ jobs:
         }
       }
 
-      const oversized = extractedFiles.filter((f) => f.size > 50 * 1024 * 1024);
+      const oversized = activeFiles.filter((f) => f.size > 50 * 1024 * 1024);
       if (oversized.length > 0) {
         const names = oversized.map((f) => f.path).join(', ');
         addLog(`警告: 检测到大文件超过 50MB [${names}]，GitHub REST API 传输此类大文件可能失败`, 'info');
@@ -1314,7 +1643,7 @@ jobs:
       setUploadProgress(15);
 
       // Build upload target list with optional subdirectory prefix
-      const uploadTargets = extractedFiles
+      const uploadTargets = activeFiles
         .map((file) => {
           const relativeNormalized = sanitizeGitPath(file.path);
           if (!relativeNormalized) return null;
@@ -1322,6 +1651,8 @@ jobs:
           return { file, fullRepoPath };
         })
         .filter((x): x is { file: ExtractedFile; fullRepoPath: string } => x !== null);
+
+      let lastUploadedStats = { total: uploadTargets.length, uploaded: uploadTargets.length, reused: 0 };
 
       const uploadAllBlobs = async (useCacheAndRemoteDiff = true) => {
         const items: ({ path: string; mode: string; type: string; sha: string } | null)[] = new Array(
@@ -1426,6 +1757,12 @@ jobs:
         const validItems = items.filter(
           (item): item is { path: string; mode: string; type: string; sha: string } => item !== null
         );
+
+        lastUploadedStats = {
+          total: uploadTargets.length,
+          uploaded: uploadTargets.length - cacheOrRemoteHits,
+          reused: cacheOrRemoteHits
+        };
 
         if (cacheOrRemoteHits > 0) {
           addLog(
@@ -1608,6 +1945,26 @@ jobs:
       setUploadSuccess(true);
       addLog('部署成功！远端 GitHub 仓库文件已更新。', 'success');
 
+      const newRecord: DeployHistoryRecord = {
+        id: `hist_${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        username: cleanUsername,
+        repo: cleanRepo,
+        branch: cleanBranch,
+        targetSubdir: cleanSubdir,
+        commitMessage: commitMessage.trim() || 'refactor: auto deploy unzipped contents',
+        commitSha: commitData.sha,
+        commitUrl: commitData.html_url || `https://github.com/${cleanUsername}/${cleanRepo}/commit/${commitData.sha}`,
+        sourceName: sourceInfo?.name || 'package.zip',
+        sourceKind: sourceInfo?.kind || 'zip',
+        totalFiles: lastUploadedStats.total,
+        uploadedFiles: lastUploadedStats.uploaded,
+        reusedFiles: lastUploadedStats.reused,
+        durationMs: Math.round(performance.now() - uploadStartTime),
+        forcePush
+      };
+      setDeployHistory((prev) => [newRecord, ...prev].slice(0, 50));
+
       triggerPagesAutoSetup();
     } catch (err: any) {
       console.error(err);
@@ -1626,6 +1983,16 @@ jobs:
     }
   };
 
+  const handleApplyHistoryConfig = (record: DeployHistoryRecord) => {
+    setUsername(record.username);
+    setRepo(record.repo);
+    setBranch(record.branch);
+    setTargetSubdir(record.targetSubdir);
+    setForcePush(record.forcePush);
+    setActiveProfileId('');
+    setActiveView('deploy');
+  };
+
   const handleCopy = (text: string, key: string) => {
     navigator.clipboard.writeText(text);
     setCopiedKey(key);
@@ -1636,7 +2003,7 @@ jobs:
     username !== 'your-username' && repo !== 'your-repository' && username.trim() && repo.trim();
 
   return (
-    <div className="min-h-screen flex bg-[#F8F8F7] dark:bg-[#0B0B0C] text-[#141413] dark:text-[#F4F4F5] transition-colors duration-150">
+    <div className="min-h-screen flex bg-[#ECEDEF] dark:bg-[#0C0D0F] text-[#141414] dark:text-[#F4F4F5] transition-colors duration-150 overflow-x-hidden">
       {/* Left Navigation Sidebar */}
       <Sidebar
         activeView={activeView}
@@ -1646,42 +2013,44 @@ jobs:
         isRefreshingSite={isRefreshingSite}
         onForceUpdateSite={handleForceUpdateSite}
         onOpenSecurityNotice={() => setWelcomeModalOpen(true)}
+        deployHistoryCount={deployHistory.length}
+        onOpenDeployHistory={() => setHistoryModalOpen(true)}
         mobileOpen={mobileNavOpen}
         onCloseMobile={() => setMobileNavOpen(false)}
       />
 
       {/* Right Main Area */}
-      <div className="flex-1 min-w-0 flex flex-col">
+      <div className="flex-1 min-w-0 flex flex-col overflow-x-hidden">
         {/* Top Contextual Header */}
-        <header className="h-16 px-4 sm:px-6 lg:px-8 border-b border-neutral-200/80 dark:border-neutral-800 bg-[#FFFFFF]/85 dark:bg-[#111113]/85 backdrop-blur-md sticky top-0 z-20 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3 min-w-0">
+        <header className="h-[68px] sm:h-[72px] px-4 sm:px-8 lg:px-10 border-b border-black/[0.06] dark:border-white/[0.07] bg-[#ECEDEF]/85 dark:bg-[#0C0D0F]/85 backdrop-blur-xl sticky top-0 z-20 flex items-center justify-between gap-2 sm:gap-4 w-full min-w-0">
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0">
             <button
               type="button"
               onClick={() => setMobileNavOpen(true)}
-              className="lg:hidden p-2 -ml-1.5 rounded-lg text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
+              className="lg:hidden p-2 -ml-1 rounded-full text-zinc-600 dark:text-zinc-300 hover:bg-white/80 dark:hover:bg-white/10 transition-colors shrink-0"
               aria-label="打开导航菜单"
             >
               <Menu className="w-4 h-4" />
             </button>
 
             <div className="flex items-center gap-2 text-xs min-w-0">
-              <span className="font-medium text-neutral-400 dark:text-neutral-500 whitespace-nowrap hidden sm:inline">
+              <span className="font-medium text-zinc-500 dark:text-zinc-400 whitespace-nowrap hidden sm:inline">
                 zipdeploy
               </span>
-              <span className="text-neutral-300 dark:text-neutral-700 hidden sm:inline" aria-hidden="true">
+              <span className="text-zinc-400 dark:text-zinc-600 hidden sm:inline" aria-hidden="true">
                 /
               </span>
-              <h1 className="font-semibold text-neutral-900 dark:text-neutral-100 truncate">
+              <h1 className="font-semibold text-[#141414] dark:text-white truncate">
                 {VIEW_TITLES[activeView]}
               </h1>
             </div>
           </div>
 
-          <div className="flex items-center gap-2.5 shrink-0">
+          <div className="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
             <button
               type="button"
               onClick={toggleTheme}
-              className="lg:hidden p-2 rounded-lg text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
+              className="lg:hidden p-2 rounded-full text-zinc-600 dark:text-zinc-300 bg-white dark:bg-[#17181C] border border-black/[0.05] dark:border-white/[0.08] transition-colors shrink-0"
               aria-label="切换明暗主题"
             >
               {theme === 'dark' ? <Moon className="w-4 h-4" /> : <Sun className="w-4 h-4" />}
@@ -1690,10 +2059,12 @@ jobs:
             <button
               type="button"
               onClick={() => openQuickDrawer('guide')}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-neutral-700 dark:text-neutral-200 bg-neutral-100 dark:bg-neutral-800/80 hover:bg-neutral-200/70 dark:hover:bg-neutral-800 transition-colors whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 sm:gap-2 px-3 sm:px-4 py-2 rounded-full text-xs font-medium text-[#141414] dark:text-white bg-white dark:bg-[#17181C] border border-black/[0.05] dark:border-white/[0.08] hover:shadow-sm transition-all shadow-[0_2px_10px_-2px_rgba(0,0,0,0.05)] whitespace-nowrap shrink-0"
             >
-              <BookOpen className="w-3.5 h-3.5" />
-              <span>速查抽屉</span>
+              <BookOpen className="w-3.5 h-3.5 text-zinc-500 dark:text-zinc-400" />
+              <span>
+                速查<span className="hidden sm:inline">抽屉</span>
+              </span>
             </button>
 
             {hasConfiguredRepo && (
@@ -1701,18 +2072,20 @@ jobs:
                 href={`https://github.com/${username}/${repo}`}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-medium bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 hover:opacity-90 transition-opacity whitespace-nowrap shrink-0"
+                className="inline-flex items-center gap-1.5 sm:gap-2 px-3 sm:px-4 py-2 rounded-full text-xs font-semibold bg-[#141414] dark:bg-white text-white dark:text-[#141414] hover:opacity-90 transition-opacity shadow-[0_4px_14px_-2px_rgba(0,0,0,0.2)] whitespace-nowrap shrink-0"
               >
                 <Github className="w-3.5 h-3.5" />
-                <span>目标仓库</span>
-                <ArrowUpRight className="w-3 h-3 opacity-70" />
+                <span>
+                  <span className="hidden sm:inline">目标</span>仓库
+                </span>
+                <ArrowUpRight className="w-3 h-3 opacity-75" />
               </a>
             )}
           </div>
         </header>
 
         {/* Active View Viewport */}
-        <main className="flex-1 px-4 sm:px-6 lg:px-8 py-7 max-w-[1320px] w-full mx-auto">
+        <main className="flex-1 px-4 sm:px-8 lg:px-10 py-6 sm:py-8 max-w-[1300px] w-full mx-auto min-w-0">
           {activeView === 'deploy' && (
             <DeployWorkspace
               token={token}
@@ -1748,9 +2121,15 @@ jobs:
               onCheckToken={handleCheckToken}
               onOpenRollback={handleOpenRollback}
               onOpenCreateRepo={handleOpenCreateRepo}
+              onOpenDiffPreview={handleOpenDiffPreview}
               fileInputRef={fileInputRef}
-              zipFile={zipFile}
+              folderInputRef={folderInputRef}
+              sourceInfo={sourceInfo}
               extractedFiles={extractedFiles}
+              excludedPaths={excludedPaths}
+              onToggleExcludeFile={handleToggleExcludeFile}
+              onExcludeAllLargeFiles={handleExcludeAllLargeFiles}
+              onRestoreAllExcluded={handleRestoreAllExcluded}
               isUnzipping={isUnzipping}
               unzipError={unzipError}
               fileSearch={fileSearch}
@@ -1760,6 +2139,7 @@ jobs:
               ignoreNodeModules={ignoreNodeModules}
               filterStats={filterStats}
               onFileChange={handleFileChange}
+              onFolderChange={handleFolderChange}
               onDrop={handleDrop}
               onGenerateSampleZip={handleGenerateSampleZip}
               onToggleNodeModules={handleToggleNodeModules}
@@ -1848,11 +2228,34 @@ jobs:
         open={createRepoModalOpen}
         onClose={() => setCreateRepoModalOpen(false)}
         defaultRepoName={repo}
-        hasExtractedFiles={extractedFiles.length > 0}
+        hasExtractedFiles={extractedFiles.length - excludedPaths.size > 0}
         isCreating={isCreatingRepo}
         error={createRepoError}
         createdSuccessName={createdRepoSuccessName}
         onCreateRepo={handleCreateRepo}
+      />
+
+      {/* Pre-Push Diff Preview Modal */}
+      <DiffPreviewModal
+        open={diffModalOpen}
+        onClose={() => setDiffModalOpen(false)}
+        isLoading={isComputingDiff}
+        error={diffError}
+        result={diffResult}
+        onRefresh={computeRemoteDiff}
+        onConfirmPush={() => {
+          setDiffModalOpen(false);
+          handleInitiateUpload();
+        }}
+      />
+
+      {/* Local Deploy History Modal */}
+      <DeployHistoryModal
+        open={historyModalOpen}
+        onClose={() => setHistoryModalOpen(false)}
+        records={deployHistory}
+        onApplyConfig={handleApplyHistoryConfig}
+        onClearHistory={() => setDeployHistory([])}
       />
     </div>
   );

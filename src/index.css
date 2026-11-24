@@ -7,6 +7,12 @@
     --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   }
 
+  html,
+  body {
+    overflow-x: hidden;
+    max-width: 100%;
+  }
+
   html {
     font-family: var(--font-sans);
     color-scheme: light;
@@ -22,7 +28,7 @@
   }
 }
 
-/* Subtle minimalist scrollbars */
+/* Clean monochrome scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -33,10 +39,14 @@
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(120, 120, 120, 0.22);
+  background: rgba(20, 20, 20, 0.18);
   border-radius: 9999px;
 }
 
+.dark ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+}
+
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(120, 120, 120, 0.38);
+  background: rgba(20, 20, 20, 0.34);
 }

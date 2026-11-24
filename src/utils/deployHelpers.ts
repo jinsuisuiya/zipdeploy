@@ -48,6 +48,52 @@ export interface CommitHistoryItem {
   htmlUrl: string;
 }
 
+export interface DiffEntry {
+  path: string;
+  status: 'added' | 'modified' | 'deleted';
+  localSize?: number;
+}
+
+export interface DiffPreviewResult {
+  targetLabel: string;
+  isNewRepoOrBranch: boolean;
+  forcePush: boolean;
+  targetSubdir: string;
+  added: DiffEntry[];
+  modified: DiffEntry[];
+  deleted: DiffEntry[];
+  unchangedCount: number;
+}
+
+export interface DeployHistoryRecord {
+  id: string;
+  timestamp: string;
+  username: string;
+  repo: string;
+  branch: string;
+  targetSubdir: string;
+  commitMessage: string;
+  commitSha: string;
+  commitUrl: string;
+  sourceName: string;
+  sourceKind: 'zip' | 'folder';
+  totalFiles: number;
+  uploadedFiles: number;
+  reusedFiles: number;
+  durationMs: number;
+  forcePush: boolean;
+}
+
+export const LARGE_FILE_WARN_BYTES = 25 * 1024 * 1024;
+export const LARGE_FILE_CRITICAL_BYTES = 95 * 1024 * 1024;
+
+export function formatFileSize(bytes: number): string {
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  }
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
 /**
  * Lossless fast conversion from Uint8Array to Base64 using native FileReader for larger buffers.
  */

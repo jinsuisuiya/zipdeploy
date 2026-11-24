@@ -8,21 +8,21 @@ interface GuideViewProps {
 
 export const GuideView: React.FC<GuideViewProps> = ({ onNavigateView }) => {
   return (
-    <div className="max-w-4xl space-y-8">
+    <div className="w-full min-w-0 max-w-4xl space-y-7">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4 pb-6 border-b border-neutral-200/80 dark:border-neutral-800">
+      <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4 pb-5 border-b border-black/[0.07] dark:border-white/[0.08]">
         <div className="space-y-1.5">
-          <p className="text-xs font-medium text-neutral-500 dark:text-neutral-400">
+          <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">
             上手指南 · 3 分钟完成首次发布
           </p>
-          <h2 className="text-2xl font-semibold tracking-tight text-neutral-900 dark:text-neutral-100">
+          <h2 className="text-xl font-semibold tracking-tight text-[#141414] dark:text-white">
             零基础三步将 ZIP 代码部署到 GitHub
           </h2>
         </div>
         <button
           type="button"
           onClick={() => onNavigateView('deploy')}
-          className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 hover:opacity-90 transition-opacity whitespace-nowrap shrink-0 self-start sm:self-auto"
+          className="inline-flex items-center gap-2 px-5 py-2.5 rounded-full text-xs font-semibold bg-[#141414] dark:bg-white text-white dark:text-[#141414] hover:opacity-90 transition-opacity shadow-[0_6px_16px_-4px_rgba(0,0,0,0.2)] whitespace-nowrap shrink-0 self-start sm:self-auto"
         >
           <span>前往部署工作台</span>
           <ArrowRight className="w-3.5 h-3.5" />
@@ -31,15 +31,17 @@ export const GuideView: React.FC<GuideViewProps> = ({ onNavigateView }) => {
 
       {/* 3 Steps Grid */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-        <div className="bg-[#FFFFFF] dark:bg-[#141416] border border-neutral-200/80 dark:border-neutral-800 rounded-xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.03)] flex flex-col justify-between space-y-4">
+        <div className="bg-white dark:bg-[#17181C] border border-black/[0.04] dark:border-white/[0.08] rounded-[24px] p-6 shadow-[0_8px_28px_-6px_rgba(0,0,0,0.06)] flex flex-col justify-between space-y-5">
           <div className="space-y-3">
-            <span className="font-mono text-xs text-neutral-400 dark:text-neutral-500">01.</span>
-            <h3 className="text-sm font-semibold text-neutral-900 dark:text-neutral-100">
+            <span className="w-7 h-7 rounded-full bg-[#141414] dark:bg-white text-white dark:text-[#141414] font-mono text-[11px] font-semibold inline-flex items-center justify-center">
+              01
+            </span>
+            <h3 className="text-sm font-semibold text-[#141414] dark:text-white">
               获取 GitHub Token (密钥)
             </h3>
-            <p className="text-xs text-neutral-600 dark:text-neutral-400 leading-relaxed">
+            <p className="text-xs text-zinc-600 dark:text-zinc-400 leading-relaxed">
               打开 GitHub → Settings → Developer Settings → Personal Access Tokens (classic) → 新建 Token，务必勾选{' '}
-              <code className="px-1.5 py-0.5 rounded bg-neutral-100 dark:bg-neutral-800 text-neutral-900 dark:text-neutral-100 font-mono">
+              <code className="px-1.5 py-0.5 rounded-md bg-[#F2F3F5] dark:bg-[#23252C] text-[#141414] dark:text-white font-mono">
                 repo
               </code>{' '}
               选项，生成的字符串就是 Token。
@@ -49,69 +51,79 @@ export const GuideView: React.FC<GuideViewProps> = ({ onNavigateView }) => {
             href="https://github.com/settings/tokens/new?scopes=repo&description=ZipDeploy"
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 text-xs font-medium text-neutral-900 dark:text-neutral-100 underline underline-offset-4 hover:opacity-75 pt-2"
+            className="inline-flex items-center gap-1 text-xs font-semibold text-[#141414] dark:text-white underline underline-offset-4 hover:opacity-75 pt-1"
           >
             <span>直接前往 GitHub 创建 Token</span>
             <ArrowUpRight className="w-3.5 h-3.5" />
           </a>
         </div>
 
-        <div className="bg-[#FFFFFF] dark:bg-[#141416] border border-neutral-200/80 dark:border-neutral-800 rounded-xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.03)] space-y-3">
-          <span className="font-mono text-xs text-neutral-400 dark:text-neutral-500">02.</span>
-          <h3 className="text-sm font-semibold text-neutral-900 dark:text-neutral-100">
+        <div className="bg-white dark:bg-[#17181C] border border-black/[0.04] dark:border-white/[0.08] rounded-[24px] p-6 shadow-[0_8px_28px_-6px_rgba(0,0,0,0.06)] space-y-3">
+          <span className="w-7 h-7 rounded-full bg-[#141414] dark:bg-white text-white dark:text-[#141414] font-mono text-[11px] font-semibold inline-flex items-center justify-center">
+            02
+          </span>
+          <h3 className="text-sm font-semibold text-[#141414] dark:text-white">
             填入账号与目标仓库
           </h3>
-          <p className="text-xs text-neutral-600 dark:text-neutral-400 leading-relaxed">
-            在工作台参数区填入 Token、GitHub 用户名与目标仓库名称。勾选「强制清空重置」会自动清理此前误传的冗余历史文件；空白新建仓库也会自动初始化首个节点。
+          <p className="text-xs text-zinc-600 dark:text-zinc-400 leading-relaxed">
+            在工作台参数区填入 Token、用户名与目标仓库名（若尚无仓库可点「一键新建」）。展开高级设置中的「强制清空重置」可自动清理此前误传的冗余历史文件。
           </p>
         </div>
 
-        <div className="bg-[#FFFFFF] dark:bg-[#141416] border border-neutral-200/80 dark:border-neutral-800 rounded-xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.03)] space-y-3">
-          <span className="font-mono text-xs text-neutral-400 dark:text-neutral-500">03.</span>
-          <h3 className="text-sm font-semibold text-neutral-900 dark:text-neutral-100">
-            拖入 ZIP 一键覆盖上传
+        <div className="bg-white dark:bg-[#17181C] border border-black/[0.04] dark:border-white/[0.08] rounded-[24px] p-6 shadow-[0_8px_28px_-6px_rgba(0,0,0,0.06)] space-y-3">
+          <span className="w-7 h-7 rounded-full bg-[#141414] dark:bg-white text-white dark:text-[#141414] font-mono text-[11px] font-semibold inline-flex items-center justify-center">
+            03
+          </span>
+          <h3 className="text-sm font-semibold text-[#141414] dark:text-white">
+            拖入 ZIP 一键并发上传
           </h3>
-          <p className="text-xs text-neutral-600 dark:text-neutral-400 leading-relaxed">
+          <p className="text-xs text-zinc-600 dark:text-zinc-400 leading-relaxed">
             将电脑或手机里的{' '}
-            <code className="px-1.5 py-0.5 rounded bg-neutral-100 dark:bg-neutral-800 text-neutral-900 dark:text-neutral-100 font-mono">
+            <code className="px-1.5 py-0.5 rounded-md bg-[#F2F3F5] dark:bg-[#23252C] text-[#141414] dark:text-white font-mono">
               .zip
             </code>{' '}
-            压缩包拖入上传区，网页将在浏览器内存中瞬间完成清洗与解压，通过官方 REST API 直推仓库。
+            压缩包拖入上传区，网页将在本地瞬间完成清洗、安全体检与 5 路并发无损直推。
           </p>
         </div>
       </div>
 
       {/* Design & Architecture Guarantees */}
-      <div className="bg-[#FFFFFF] dark:bg-[#141416] border border-neutral-200/80 dark:border-neutral-800 rounded-xl p-6 shadow-[0_1px_3px_rgba(0,0,0,0.03)]">
-        <h3 className="text-sm font-semibold text-neutral-900 dark:text-neutral-100 mb-4">
+      <div className="bg-white dark:bg-[#17181C] border border-black/[0.04] dark:border-white/[0.08] rounded-[24px] p-6 shadow-[0_8px_28px_-6px_rgba(0,0,0,0.06)]">
+        <h3 className="text-sm font-semibold text-[#141414] dark:text-white mb-5">
           为什么推荐用 zipdeploy 进行部署？
         </h3>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 divide-y md:divide-y-0 md:divide-x divide-neutral-200/70 dark:divide-neutral-800/80">
-          <div className="pt-4 md:pt-0 space-y-1.5">
-            <div className="flex items-center gap-2 text-xs font-semibold text-neutral-900 dark:text-neutral-100">
-              <ShieldCheck className="w-4 h-4 text-neutral-500 dark:text-neutral-400" />
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 divide-y md:divide-y-0 md:divide-x divide-black/[0.06] dark:divide-white/[0.07]">
+          <div className="pt-4 md:pt-0 space-y-2">
+            <div className="flex items-center gap-2.5 text-xs font-semibold text-[#141414] dark:text-white">
+              <span className="w-7 h-7 rounded-full bg-[#141414] dark:bg-white text-white dark:text-[#141414] flex items-center justify-center shrink-0">
+                <ShieldCheck className="w-3.5 h-3.5" />
+              </span>
               <span>纯前端零服务器中转</span>
             </div>
-            <p className="text-xs text-neutral-500 dark:text-neutral-400 leading-relaxed">
-              解压与 API 请求全部发生在你的浏览器本地，Token 不会离开你的设备。
+            <p className="text-xs text-zinc-600 dark:text-zinc-400 leading-relaxed">
+              解压、密钥扫描与 API 请求全部发生在你的浏览器本地，Token 不会离开你的设备。
             </p>
           </div>
-          <div className="pt-4 md:pt-0 md:pl-6 space-y-1.5">
-            <div className="flex items-center gap-2 text-xs font-semibold text-neutral-900 dark:text-neutral-100">
-              <Layers className="w-4 h-4 text-neutral-500 dark:text-neutral-400" />
+          <div className="pt-4 md:pt-0 md:pl-6 space-y-2">
+            <div className="flex items-center gap-2.5 text-xs font-semibold text-[#141414] dark:text-white">
+              <span className="w-7 h-7 rounded-full bg-[#141414] dark:bg-white text-white dark:text-[#141414] flex items-center justify-center shrink-0">
+                <Layers className="w-3.5 h-3.5" />
+              </span>
               <span>自动打平嵌套目录</span>
             </div>
-            <p className="text-xs text-neutral-500 dark:text-neutral-400 leading-relaxed">
+            <p className="text-xs text-zinc-600 dark:text-zinc-400 leading-relaxed">
               若压缩包外层套了一层总文件夹，程序会自动剥离外层并对齐根目录结构。
             </p>
           </div>
-          <div className="pt-4 md:pt-0 md:pl-6 space-y-1.5">
-            <div className="flex items-center gap-2 text-xs font-semibold text-neutral-900 dark:text-neutral-100">
-              <Sparkles className="w-4 h-4 text-neutral-500 dark:text-neutral-400" />
-              <span>智能清洗与 Pages 注入</span>
+          <div className="pt-4 md:pt-0 md:pl-6 space-y-2">
+            <div className="flex items-center gap-2.5 text-xs font-semibold text-[#141414] dark:text-white">
+              <span className="w-7 h-7 rounded-full bg-[#141414] dark:bg-white text-white dark:text-[#141414] flex items-center justify-center shrink-0">
+                <Sparkles className="w-3.5 h-3.5" />
+              </span>
+              <span>SHA-1 去重与并发加速</span>
             </div>
-            <p className="text-xs text-neutral-500 dark:text-neutral-400 leading-relaxed">
-              自动屏蔽 .DS_Store / __MACOSX / node_modules，并支持一键拉起 GitHub Pages 云端打包。
+            <p className="text-xs text-zinc-600 dark:text-zinc-400 leading-relaxed">
+              自动比对远端指纹跳过未修改文件，其余文件通过 5 路并发无损直推，并实时追踪云端打包进度。
             </p>
           </div>
         </div>
